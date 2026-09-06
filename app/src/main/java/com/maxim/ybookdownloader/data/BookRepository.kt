@@ -13,7 +13,6 @@ class BookRepository(private val context: Context) {
     private val api = Retrofit.Builder()
         .baseUrl(BookmateApiFactory.BASE_URL)
         .client(OkHttpClient.Builder().build())
-        .addConverterFactory(Json { ignoreUnknownKeys = true }.asConverterFactory("application/json".toMediaType()))
         .build()
         .create(BookmateApi::class.java)
 
