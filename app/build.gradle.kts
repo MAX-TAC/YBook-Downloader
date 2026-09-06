@@ -13,8 +13,8 @@ android {
         applicationId = "com.maxim.ybookdownloader"
         minSdk = 26
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.1.1"
+        versionCode = 3
+        versionName = "0.1.2"
     }
 
     buildTypes {
@@ -50,7 +50,6 @@ dependencies {
 
     implementation("com.squareup.okhttp3:okhttp:5.1.0")
     implementation("com.squareup.retrofit2:retrofit:3.0.0")
-    implementation("com.jakewharton.retrofit:retrofit2-kotlinx-serialization-converter:1.0.0")
     implementation("io.coil-kt.coil3:coil-compose:3.3.0")
     implementation("io.coil-kt.coil3:coil-network-okhttp:3.3.0")
 }

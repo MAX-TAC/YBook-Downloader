@@ -133,6 +133,7 @@ class MainViewModel : ViewModel() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
     val context = LocalContext.current
