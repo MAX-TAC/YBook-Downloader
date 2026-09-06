@@ -33,6 +33,7 @@ import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
@@ -124,8 +125,12 @@ data class BookUiState(
     val url: String = "",
     val title: String? = null,
     val coverUrl: String? = null,
+    val authors: List<String> = emptyList(),
     val bookId: String? = null,
     val resourceType: ResourceType? = null,
+    val textId: String? = null,
+    val audioId: String? = null,
+    val workKey: String = "",
     val error: String? = null,
     val message: String? = null,
     val progressLabel: String? = null,
@@ -137,14 +142,13 @@ enum class AudioQuality(val label: String, val isMax: Boolean) {
     MAX("M4A • Максимальное качество", true)
 }
 
-private enum class AudioAction { DOWNLOAD, SHARE }
-
 class MainViewModel : ViewModel() {
     private lateinit var repository: BookRepository
     private lateinit var tokenStore: TokenStore
     private lateinit var historyStore: HistoryStore
     private var epubFile: File? = null
-    private var currentTitle: String = "book"
+    private var textInfo: BookRepository.ResourceInfo? = null
+    private var audioInfo: BookRepository.ResourceInfo? = null
 
     var state by mutableStateOf(BookUiState())
         private set
@@ -180,7 +184,7 @@ class MainViewModel : ViewModel() {
         setUrl(text)
         val reference = BookUrlParser.parse(text)
         if (reference == null) {
-            showError("Не удалось распознать ссылку на книгу или аудиокнигу")
+            showError("Не удалось распознать ссылку из Яндекс Книг")
         } else {
             loadBook(reference)
         }
@@ -197,39 +201,74 @@ class MainViewModel : ViewModel() {
             busy = true,
             error = null,
             message = null,
-            progressLabel = if (ref.type == ResourceType.AUDIOBOOK) "Получение аудиокниги…" else "Получение книги…",
-            bookId = ref.id,
-            resourceType = ref.type,
+            progressLabel = "Поиск доступных версий…",
             title = null,
-            coverUrl = null
+            coverUrl = null,
+            authors = emptyList(),
+            bookId = null,
+            resourceType = null,
+            textId = null,
+            audioId = null,
+            workKey = ""
         )
         epubFile = null
+        textInfo = null
+        audioInfo = null
 
         viewModelScope.launch {
-            runCatching { repository.getResourceInfo(ref, token) }
-                .onSuccess { info ->
-                    currentTitle = info.title
+            runCatching { repository.getResourceBundle(ref, token) }
+                .onSuccess { bundle ->
+                    textInfo = bundle.text
+                    audioInfo = bundle.audio
+
+                    // Независимо от исходной ссылки сначала показываем текстовую версию,
+                    // если она существует. Пользователь может переключиться на аудио сверху.
+                    val selected = bundle.text ?: bundle.audio
+                        ?: error("Не найдена доступная версия произведения")
                     state = state.copy(
                         busy = false,
                         progressLabel = null,
-                        title = info.title,
-                        coverUrl = info.coverUrl,
-                        resourceType = info.type
+                        title = selected.title,
+                        coverUrl = selected.coverUrl,
+                        authors = selected.authors,
+                        bookId = selected.id,
+                        resourceType = selected.type,
+                        textId = bundle.text?.id,
+                        audioId = bundle.audio?.id,
+                        workKey = bundle.workKey
                     )
                 }
                 .onFailure {
                     state = state.copy(
                         busy = false,
                         progressLabel = null,
-                        error = it.message ?: "Не удалось получить книгу"
+                        error = it.message ?: "Не удалось получить произведение"
                     )
                 }
         }
     }
 
+    fun selectResourceType(type: ResourceType) {
+        val info = when (type) {
+            ResourceType.BOOK -> textInfo
+            ResourceType.AUDIOBOOK -> audioInfo
+        } ?: return
+
+        epubFile = if (type == ResourceType.BOOK) epubFile else null
+        state = state.copy(
+            title = info.title,
+            coverUrl = info.coverUrl,
+            authors = info.authors,
+            bookId = info.id,
+            resourceType = info.type,
+            error = null,
+            message = null
+        )
+    }
+
     fun download(context: Context, format: BookExporter.Format) {
         if (state.resourceType != ResourceType.BOOK) {
-            showError("Для аудиокниги выберите качество M4A")
+            showError("Сначала выберите вкладку «Текст»")
             return
         }
         val id = state.bookId ?: return
@@ -251,7 +290,6 @@ class MainViewModel : ViewModel() {
                 }
             }.onSuccess { (file, result) ->
                 epubFile = file
-                currentTitle = title
                 val item = DownloadHistoryItem(
                     bookId = id,
                     title = title,
@@ -261,7 +299,9 @@ class MainViewModel : ViewModel() {
                     format = format.label,
                     mime = format.mime,
                     uri = result.uri.toString(),
-                    displayPath = result.displayPath
+                    displayPath = result.displayPath,
+                    workKey = state.workKey,
+                    authors = state.authors.joinToString(", ")
                 )
                 history = historyStore.add(item)
                 state = state.copy(
@@ -280,7 +320,10 @@ class MainViewModel : ViewModel() {
     }
 
     fun downloadAudiobook(context: Context, quality: AudioQuality) {
-        if (state.resourceType != ResourceType.AUDIOBOOK) return
+        if (state.resourceType != ResourceType.AUDIOBOOK) {
+            showError("Сначала выберите вкладку «Аудио»")
+            return
+        }
         val id = state.bookId ?: return
         val title = state.title ?: "audiobook"
         val token = tokenStore.getToken() ?: run {
@@ -330,7 +373,9 @@ class MainViewModel : ViewModel() {
                     mime = AudioExporter.MIME_M4A,
                     uri = results.first().uri.toString(),
                     uris = results.map { it.uri.toString() },
-                    displayPath = displayPath
+                    displayPath = displayPath,
+                    workKey = state.workKey,
+                    authors = state.authors.joinToString(", ")
                 )
                 history = historyStore.add(item)
                 state = state.copy(
@@ -348,91 +393,37 @@ class MainViewModel : ViewModel() {
         }
     }
 
-    fun shareCurrentBook(context: Context) {
-        val id = state.bookId ?: return
-        val title = state.title ?: "book"
-        val token = tokenStore.getToken() ?: run {
-            showError("Сессия Яндекса не найдена. Войдите заново.")
-            return
-        }
-
-        state = state.copy(busy = true, error = null, message = null, progressLabel = "Подготовка книги…")
-        viewModelScope.launch {
-            runCatching {
-                withContext(Dispatchers.IO) {
-                    epubFile?.takeIf { it.exists() }
-                        ?: repository.downloadEpub(id, token, state.coverUrl)
-                }
-            }.onSuccess { file ->
-                epubFile = file
-                currentTitle = title
-                state = state.copy(busy = false, progressLabel = null)
-                runCatching {
-                    val uri = BookExporter(context.applicationContext).uriForSharing(file, title)
-                    shareUri(context, uri, BookExporter.Format.EPUB.mime, "Поделиться книгой")
-                }.onFailure {
-                    showError(it.message ?: "Ошибка подготовки книги")
-                }
-            }.onFailure {
-                state = state.copy(
-                    busy = false,
-                    progressLabel = null,
-                    error = it.message ?: "Ошибка скачивания"
-                )
+    /**
+     * В v0.5.0 «Поделиться» принципиально НЕ скачивает ничего заново.
+     * Возвращаем только уже сохранённые пользователем форматы текущего произведения.
+     */
+    fun shareableDownloads(): List<DownloadHistoryItem> {
+        val workKey = state.workKey
+        val currentTitle = BookRepository.normalize(state.title.orEmpty())
+        return history
+            .asSequence()
+            .filter { item ->
+                (workKey.isNotBlank() && item.workKey == workKey) ||
+                    (item.workKey.isBlank() && BookRepository.normalize(item.title) == currentTitle)
             }
-        }
-    }
-
-    fun shareAudiobook(context: Context, quality: AudioQuality) {
-        if (state.resourceType != ResourceType.AUDIOBOOK) return
-        val id = state.bookId ?: return
-        val title = state.title ?: "audiobook"
-        val token = tokenStore.getToken() ?: run {
-            showError("Сессия Яндекса не найдена. Войдите заново.")
-            return
-        }
-
-        state = state.copy(busy = true, error = null, message = null, progressLabel = "Получение списка дорожек…")
-        viewModelScope.launch {
-            try {
-                val tracks = withContext(Dispatchers.IO) { repository.getAudiobookTracks(id, token) }
-                check(tracks.isNotEmpty()) { "В аудиокниге не найдены доступные дорожки" }
-                val exporter = AudioExporter(context.applicationContext)
-                val uris = mutableListOf<Uri>()
-
-                tracks.forEachIndexed { index, track ->
-                    state = state.copy(progressLabel = "Подготовка дорожки ${index + 1} из ${tracks.size}…")
-                    val url = (if (quality.isMax) track.maxUrl else track.minUrl)
-                        ?: error("Для дорожки ${index + 1} нет ссылки выбранного качества")
-                    val uri = withContext(Dispatchers.IO) {
-                        val workDir = File(context.cacheDir, "audio_work").apply { mkdirs() }
-                        val temp = File(workDir, "$id-${track.number}.m4a")
-                        try {
-                            repository.downloadAudioTrack(url, token, temp)
-                            exporter.uriForSharing(temp, title, track.number, tracks.size)
-                        } finally {
-                            temp.delete()
-                        }
-                    }
-                    uris += uri
-                }
-
-                state = state.copy(busy = false, progressLabel = null)
-                shareUris(context, uris, AudioExporter.MIME_M4A, "Поделиться аудиокнигой")
-            } catch (e: Exception) {
-                state = state.copy(
-                    busy = false,
-                    progressLabel = null,
-                    error = e.message ?: "Ошибка подготовки аудиокниги"
+            .distinctBy { item ->
+                val normalizedFormat = item.format.replace(
+                    Regex("\\s*•\\s*\\d+\\s+файл.*$", RegexOption.IGNORE_CASE),
+                    ""
                 )
+                "${item.resourceType}|$normalizedFormat"
             }
-        }
+            .toList()
     }
 
     fun shareHistoryItem(context: Context, item: DownloadHistoryItem) {
         runCatching {
             val all = if (item.uris.isNotEmpty()) item.uris else listOf(item.uri)
             val parsed = all.map(Uri::parse)
+            parsed.forEach { uri ->
+                context.contentResolver.openFileDescriptor(uri, "r")?.use { }
+                    ?: error("Сохранённый файл больше недоступен")
+            }
             if (parsed.size == 1) {
                 shareUri(
                     context,
@@ -457,7 +448,8 @@ class MainViewModel : ViewModel() {
     fun logout() {
         tokenStore.clear()
         epubFile = null
-        currentTitle = "book"
+        textInfo = null
+        audioInfo = null
         state = BookUiState()
     }
 
@@ -504,12 +496,13 @@ fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
     var showSearchDialog by remember { mutableStateOf(false) }
     var showFormats by remember { mutableStateOf(false) }
     var showAudioQuality by remember { mutableStateOf(false) }
-    var audioAction by remember { mutableStateOf(AudioAction.DOWNLOAD) }
+    var showShareDialog by remember { mutableStateOf(false) }
     var settingsExpanded by remember { mutableStateOf(false) }
     var searchInput by remember { mutableStateOf("") }
     var pendingStorageAction by remember { mutableStateOf<(() -> Unit)?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
     val state = vm.state
+    val shareable = vm.shareableDownloads()
 
     val authLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -527,7 +520,7 @@ fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
         if (granted) {
             action?.invoke()
         } else {
-            vm.showError("Без доступа к файлам Android 8/9 не может сохранить книгу в папку Загрузки")
+            vm.showError("Без доступа к файлам Android 8/9 не может сохранить файл в папку Загрузки")
         }
     }
 
@@ -562,10 +555,7 @@ fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
     LaunchedEffect(state.error, state.message) {
         val text = state.error ?: state.message
         if (!text.isNullOrBlank()) {
-            snackbarHostState.showSnackbar(
-                message = text,
-                duration = SnackbarDuration.Short
-            )
+            snackbarHostState.showSnackbar(text, duration = SnackbarDuration.Short)
             vm.clearNotice()
         }
     }
@@ -587,7 +577,7 @@ fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
                             onClick = { openSearch() },
                             enabled = !state.busy
                         ) {
-                            Icon(Icons.Default.Add, contentDescription = "Добавить книгу или аудиокнигу")
+                            Icon(Icons.Default.Add, contentDescription = "Добавить книгу")
                         }
                     }
                     Box {
@@ -633,23 +623,14 @@ fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
             AppSection.HOME -> HomeScreen(
                 modifier = Modifier.padding(padding),
                 state = state,
+                hasShareableFiles = shareable.isNotEmpty(),
                 onSearch = { openSearch() },
+                onSelectType = vm::selectResourceType,
                 onDownload = {
-                    if (state.resourceType == ResourceType.AUDIOBOOK) {
-                        audioAction = AudioAction.DOWNLOAD
-                        showAudioQuality = true
-                    } else {
-                        showFormats = true
-                    }
+                    if (state.resourceType == ResourceType.AUDIOBOOK) showAudioQuality = true
+                    else showFormats = true
                 },
-                onShare = {
-                    if (state.resourceType == ResourceType.AUDIOBOOK) {
-                        audioAction = AudioAction.SHARE
-                        showAudioQuality = true
-                    } else {
-                        vm.shareCurrentBook(context)
-                    }
-                }
+                onShare = { showShareDialog = true }
             )
 
             AppSection.HISTORY -> HistoryScreen(
@@ -673,17 +654,13 @@ fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
                     ?.coerceToText(context)
                     ?.toString()
                     .orEmpty()
-                if (text.isBlank()) {
-                    vm.showError("Буфер обмена пуст")
-                } else {
-                    searchInput = text
-                }
+                if (text.isBlank()) vm.showError("Буфер обмена пуст") else searchInput = text
             },
             onDismiss = { if (!state.busy) showSearchDialog = false },
             onSearch = {
                 val ref = BookUrlParser.parse(searchInput)
                 if (ref == null) {
-                    vm.showError("Не удалось распознать ссылку на книгу или аудиокнигу")
+                    vm.showError("Не удалось распознать ссылку из Яндекс Книг")
                 } else {
                     vm.setUrl(searchInput)
                     showSearchDialog = false
@@ -706,14 +683,21 @@ fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
 
     if (showAudioQuality) {
         AudioQualityDialog(
-            action = audioAction,
             onDismiss = { showAudioQuality = false },
             onSelect = { quality ->
                 showAudioQuality = false
-                when (audioAction) {
-                    AudioAction.DOWNLOAD -> runWithStorageAccess { vm.downloadAudiobook(context, quality) }
-                    AudioAction.SHARE -> vm.shareAudiobook(context, quality)
-                }
+                runWithStorageAccess { vm.downloadAudiobook(context, quality) }
+            }
+        )
+    }
+
+    if (showShareDialog) {
+        ShareDownloadedDialog(
+            items = shareable,
+            onDismiss = { showShareDialog = false },
+            onSelect = { item ->
+                showShareDialog = false
+                vm.shareHistoryItem(context, item)
             }
         )
     }
@@ -723,7 +707,9 @@ fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
 private fun HomeScreen(
     modifier: Modifier,
     state: BookUiState,
+    hasShareableFiles: Boolean,
     onSearch: () -> Unit,
+    onSelectType: (ResourceType) -> Unit,
     onDownload: () -> Unit,
     onShare: () -> Unit
 ) {
@@ -759,20 +745,13 @@ private fun HomeScreen(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
+                        Text("Найдите книгу", style = MaterialTheme.typography.headlineSmall)
                         Text(
-                            "Найдите книгу или аудиокнигу",
-                            style = MaterialTheme.typography.headlineSmall,
-                            textAlign = TextAlign.Center
-                        )
-                        Text(
-                            "Используйте ссылку на книгу или аудиокнигу, полученную через «Поделиться» в приложении «Яндекс Книги».",
+                            "Подойдёт ссылка как на текстовую, так и на аудиоверсию из приложения «Яндекс Книги». Доступные варианты приложение найдёт само.",
                             style = MaterialTheme.typography.bodyMedium,
                             textAlign = TextAlign.Center
                         )
-                        Button(
-                            onClick = onSearch,
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
+                        Button(onClick = onSearch, modifier = Modifier.fillMaxWidth()) {
                             Text("Найти")
                         }
                     }
@@ -786,6 +765,56 @@ private fun HomeScreen(
                     modifier = Modifier.padding(16.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (state.resourceType == ResourceType.BOOK) {
+                            Button(
+                                onClick = { onSelectType(ResourceType.BOOK) },
+                                enabled = state.textId != null && !state.busy,
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(Icons.Default.MenuBook, contentDescription = null)
+                                Spacer(Modifier.size(6.dp))
+                                Text("Текст")
+                            }
+                        } else {
+                            OutlinedButton(
+                                onClick = { onSelectType(ResourceType.BOOK) },
+                                enabled = state.textId != null && !state.busy,
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(Icons.Default.MenuBook, contentDescription = null)
+                                Spacer(Modifier.size(6.dp))
+                                Text("Текст")
+                            }
+                        }
+
+                        if (state.resourceType == ResourceType.AUDIOBOOK) {
+                            Button(
+                                onClick = { onSelectType(ResourceType.AUDIOBOOK) },
+                                enabled = state.audioId != null && !state.busy,
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(Icons.Default.Headphones, contentDescription = null)
+                                Spacer(Modifier.size(6.dp))
+                                Text("Аудио")
+                            }
+                        } else {
+                            OutlinedButton(
+                                onClick = { onSelectType(ResourceType.AUDIOBOOK) },
+                                enabled = state.audioId != null && !state.busy,
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(Icons.Default.Headphones, contentDescription = null)
+                                Spacer(Modifier.size(6.dp))
+                                Text("Аудио")
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(18.dp))
                     state.coverUrl?.let { cover ->
                         AsyncImage(
                             model = cover,
@@ -794,25 +823,20 @@ private fun HomeScreen(
                         )
                     }
                     Spacer(Modifier.height(14.dp))
-                    if (state.resourceType == ResourceType.AUDIOBOOK) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Icon(Icons.Default.Headphones, contentDescription = null)
-                            Text(
-                                "Аудиокнига",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        Spacer(Modifier.height(8.dp))
-                    }
                     Text(
                         it,
                         style = MaterialTheme.typography.headlineSmall,
                         textAlign = TextAlign.Center
                     )
+                    if (state.authors.isNotEmpty()) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            state.authors.joinToString(", "),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center
+                        )
+                    }
                     Spacer(Modifier.height(20.dp))
                     Button(
                         onClick = onDownload,
@@ -824,12 +848,20 @@ private fun HomeScreen(
                     Spacer(Modifier.height(10.dp))
                     OutlinedButton(
                         onClick = onShare,
-                        enabled = !state.busy,
+                        enabled = !state.busy && hasShareableFiles,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Icon(Icons.Default.Share, contentDescription = null)
                         Spacer(Modifier.size(8.dp))
                         Text("Поделиться")
+                    }
+                    if (!hasShareableFiles) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "Сначала скачайте хотя бы один формат",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                 }
             }
@@ -857,23 +889,18 @@ private fun HistoryScreen(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text("История скачиваний", style = MaterialTheme.typography.headlineSmall)
-            if (items.isNotEmpty()) {
-                TextButton(onClick = onClear) { Text("Очистить") }
-            }
+            if (items.isNotEmpty()) TextButton(onClick = onClear) { Text("Очистить") }
         }
 
         if (items.isEmpty()) {
             Card(Modifier.fillMaxWidth()) {
                 Text(
                     "Здесь появятся книги и аудиокниги, которые вы сохранили на устройство.",
-                    modifier = Modifier.padding(20.dp),
-                    style = MaterialTheme.typography.bodyMedium
+                    modifier = Modifier.padding(20.dp)
                 )
             }
         } else {
-            items.forEach { item ->
-                HistoryCard(item = item, onShare = { onShare(item) })
-            }
+            items.forEach { item -> HistoryCard(item, onShare = { onShare(item) }) }
         }
     }
 }
@@ -891,11 +918,7 @@ private fun HistoryCard(item: DownloadHistoryItem, onShare: () -> Unit) {
             horizontalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             item.coverUrl?.let {
-                AsyncImage(
-                    model = it,
-                    contentDescription = "Обложка",
-                    modifier = Modifier.size(72.dp)
-                )
+                AsyncImage(model = it, contentDescription = "Обложка", modifier = Modifier.size(72.dp))
             }
             Column(
                 modifier = Modifier.weight(1f),
@@ -932,52 +955,40 @@ private fun SearchBookDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Найти книгу или аудиокнигу") },
+        title = { Text("Найти книгу") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedTextField(
-                    value = value,
-                    onValueChange = onValueChange,
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("Ссылка из Яндекс Книг") },
-                    placeholder = { Text("https://books.yandex.ru/books/… или /audiobooks/…") },
-                    supportingText = {
-                        Text("Вставьте ссылку на книгу или аудиокнигу, полученную через «Поделиться» в приложении «Яндекс Книги».")
-                    },
-                    minLines = 2,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-                    trailingIcon = {
-                        if (value.isBlank()) {
-                            IconButton(onClick = onPaste, enabled = !busy) {
-                                Icon(
-                                    painter = painterResource(R.drawable.ic_content_paste_24),
-                                    contentDescription = "Вставить из буфера обмена"
-                                )
-                            }
-                        } else {
-                            IconButton(onClick = { onValueChange("") }, enabled = !busy) {
-                                Icon(
-                                    Icons.Default.Clear,
-                                    contentDescription = "Очистить ссылку"
-                                )
-                            }
+            OutlinedTextField(
+                value = value,
+                onValueChange = onValueChange,
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Ссылка из Яндекс Книг") },
+                placeholder = { Text("https://books.yandex.ru/…") },
+                supportingText = {
+                    Text("Вставьте ссылку через «Поделиться» в Яндекс Книгах. Подойдёт ссылка на текстовую или аудиоверсию.")
+                },
+                minLines = 2,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                trailingIcon = {
+                    if (value.isBlank()) {
+                        IconButton(onClick = onPaste, enabled = !busy) {
+                            Icon(
+                                painter = painterResource(R.drawable.ic_content_paste_24),
+                                contentDescription = "Вставить из буфера обмена"
+                            )
+                        }
+                    } else {
+                        IconButton(onClick = { onValueChange("") }, enabled = !busy) {
+                            Icon(Icons.Default.Clear, contentDescription = "Очистить ссылку")
                         }
                     }
-                )
-            }
+                }
+            )
         },
         confirmButton = {
-            Button(
-                onClick = onSearch,
-                enabled = value.isNotBlank() && !busy
-            ) {
-                Text("Найти")
-            }
+            Button(onClick = onSearch, enabled = value.isNotBlank() && !busy) { Text("Найти") }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss, enabled = !busy) {
-                Text("Отмена")
-            }
+            TextButton(onClick = onDismiss, enabled = !busy) { Text("Отмена") }
         }
     )
 }
@@ -989,18 +1000,12 @@ private fun DownloadFormatDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Скачать книгу") },
+        title = { Text("Скачать текстовую книгу") },
         text = {
             Column {
                 BookExporter.Format.entries.forEachIndexed { index, format ->
-                    TextButton(
-                        onClick = { onSelect(format) },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalAlignment = Alignment.Start
-                        ) {
+                    TextButton(onClick = { onSelect(format) }, modifier = Modifier.fillMaxWidth()) {
+                        Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.Start) {
                             Text(format.label, fontWeight = FontWeight.Medium)
                             if (format == BookExporter.Format.EPUB) {
                                 Text(
@@ -1011,41 +1016,28 @@ private fun DownloadFormatDialog(
                             }
                         }
                     }
-                    if (index < BookExporter.Format.entries.lastIndex) {
-                        HorizontalDivider()
-                    }
+                    if (index < BookExporter.Format.entries.lastIndex) HorizontalDivider()
                 }
             }
         },
         confirmButton = {},
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Отмена") }
-        }
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } }
     )
 }
 
 @Composable
 private fun AudioQualityDialog(
-    action: AudioAction,
     onDismiss: () -> Unit,
     onSelect: (AudioQuality) -> Unit
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = {
-            Text(if (action == AudioAction.DOWNLOAD) "Скачать аудиокнигу" else "Поделиться аудиокнигой")
-        },
+        title = { Text("Скачать аудиокнигу") },
         text = {
             Column {
                 AudioQuality.entries.forEachIndexed { index, quality ->
-                    TextButton(
-                        onClick = { onSelect(quality) },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalAlignment = Alignment.Start
-                        ) {
+                    TextButton(onClick = { onSelect(quality) }, modifier = Modifier.fillMaxWidth()) {
+                        Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.Start) {
                             Text(quality.label, fontWeight = FontWeight.Medium)
                             Text(
                                 if (quality.isMax) "Лучшее качество, больший размер файлов" else "Меньший размер файлов",
@@ -1059,9 +1051,38 @@ private fun AudioQualityDialog(
             }
         },
         confirmButton = {},
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Отмена") }
-        }
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } }
+    )
+}
+
+@Composable
+private fun ShareDownloadedDialog(
+    items: List<DownloadHistoryItem>,
+    onDismiss: () -> Unit,
+    onSelect: (DownloadHistoryItem) -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Поделиться") },
+        text = {
+            Column {
+                items.forEachIndexed { index, item ->
+                    TextButton(onClick = { onSelect(item) }, modifier = Modifier.fillMaxWidth()) {
+                        Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.Start) {
+                            Text(item.format, fontWeight = FontWeight.Medium)
+                            Text(
+                                if (item.resourceType == ResourceType.AUDIOBOOK.name) "Аудио" else "Текст",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                    if (index < items.lastIndex) HorizontalDivider()
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } }
     )
 }
 
@@ -1069,9 +1090,7 @@ private fun AudioQualityDialog(
 @Composable
 private fun LoginScreen(onLogin: () -> Unit) {
     Scaffold(
-        topBar = {
-            TopAppBar(title = { Text("YBook Downloader") })
-        }
+        topBar = { TopAppBar(title = { Text("YBook Downloader") }) }
     ) { padding ->
         Box(
             modifier = Modifier
@@ -1096,10 +1115,7 @@ private fun LoginScreen(onLogin: () -> Unit) {
                         style = MaterialTheme.typography.bodyMedium,
                         textAlign = TextAlign.Center
                     )
-                    Button(
-                        onClick = onLogin,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
+                    Button(onClick = onLogin, modifier = Modifier.fillMaxWidth()) {
                         Text("Войти через Яндекс")
                     }
                 }

@@ -4,13 +4,23 @@ import android.content.Context
 import com.maxim.ybookdownloader.util.BookReference
 import com.maxim.ybookdownloader.util.ResourceType
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.RequestBody.Companion.toRequestBody
 import retrofit2.Retrofit
 import java.io.File
+import java.util.Locale
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
@@ -27,13 +37,29 @@ class BookRepository(private val context: Context) {
         val type: ResourceType,
         val title: String,
         val coverUrl: String?,
-        val rawJson: String
+        val authors: List<String> = emptyList(),
+        val rawJson: String = ""
+    )
+
+    data class ResourceBundle(
+        val text: ResourceInfo?,
+        val audio: ResourceInfo?,
+        val initialType: ResourceType,
+        val workKey: String
     )
 
     data class AudioTrack(
         val number: Int,
         val minUrl: String?,
         val maxUrl: String?
+    )
+
+    private data class SearchCandidate(
+        val type: ResourceType,
+        val id: String,
+        val title: String,
+        val coverUrl: String?,
+        val authors: List<String>
     )
 
     suspend fun getResourceInfo(ref: BookReference, token: String): ResourceInfo {
@@ -54,13 +80,153 @@ class BookRepository(private val context: Context) {
 
         val title = resource["title"]?.jsonPrimitive?.contentOrNull
             ?.takeIf { it.isNotBlank() }
+            ?: resource["name"]?.jsonPrimitive?.contentOrNull
+            ?.takeIf { it.isNotBlank() }
             ?: "Без названия"
         val cover = resource["cover"]?.jsonObject
-            ?.get("large")
-            ?.jsonPrimitive
-            ?.contentOrNull
+            ?.let { coverObject ->
+                coverObject["large"]?.jsonPrimitive?.contentOrNull
+                    ?: coverObject["url"]?.jsonPrimitive?.contentOrNull
+                    ?: coverObject["small"]?.jsonPrimitive?.contentOrNull
+            }
+        val authors = extractAuthors(resource)
 
-        return ResourceInfo(ref.id, ref.type, title, cover, body)
+        return ResourceInfo(ref.id, ref.type, title, cover, authors, body)
+    }
+
+    /**
+     * Получает произведение независимо от того, какую ссылку дал пользователь.
+     * Сначала читаем точный ресурс из ссылки, затем через GraphQL Search ищем
+     * вторую версию с тем же названием (TextBook/AudioBook). Если поиск API
+     * изменится или второй версии нет, приложение продолжит работать с исходной.
+     */
+    suspend fun getResourceBundle(ref: BookReference, token: String): ResourceBundle {
+        val initial = getResourceInfo(ref, token)
+        var text: ResourceInfo? = if (initial.type == ResourceType.BOOK) initial else null
+        var audio: ResourceInfo? = if (initial.type == ResourceType.AUDIOBOOK) initial else null
+
+        val counterpartType = if (initial.type == ResourceType.BOOK) {
+            ResourceType.AUDIOBOOK
+        } else {
+            ResourceType.BOOK
+        }
+
+        val counterpart = runCatching {
+            val candidate = searchCounterpart(initial, counterpartType, token) ?: return@runCatching null
+            getResourceInfo(
+                BookReference(candidate.id, ref.sourceUrl, candidate.type),
+                token
+            )
+        }.getOrNull()
+
+        if (counterpart?.type == ResourceType.BOOK) text = counterpart
+        if (counterpart?.type == ResourceType.AUDIOBOOK) audio = counterpart
+
+        val canonical = text ?: audio ?: initial
+        return ResourceBundle(
+            text = text,
+            audio = audio,
+            initialType = ref.type,
+            workKey = makeWorkKey(canonical.title, canonical.authors)
+        )
+    }
+
+    private suspend fun searchCounterpart(
+        initial: ResourceInfo,
+        targetType: ResourceType,
+        token: String
+    ): SearchCandidate? {
+        val variables = buildJsonObject {
+            put("query", buildJsonObject {
+                put("cursor", "")
+                put("noMisspell", false)
+                put("query", initial.title)
+                put("types", buildJsonArray { })
+            })
+        }
+        val payload = buildJsonObject {
+            put("operationName", "Search")
+            put("query", GQL_SEARCH)
+            put("variables", variables)
+        }.toString()
+
+        val response = api.postGraphQl(
+            BookmateApiFactory.GRAPHQL_URL,
+            token,
+            body = payload.toRequestBody(JSON_MEDIA_TYPE)
+        )
+        if (!response.isSuccessful) return null
+
+        val body = response.body()?.string() ?: return null
+        val root = runCatching { Json.parseToJsonElement(body).jsonObject }.getOrNull() ?: return null
+        val page = root["data"]?.jsonObject
+            ?.get("search")?.jsonObject
+            ?.get("page")?.jsonArray
+            ?: return null
+
+        val initialTitle = normalize(initial.title)
+        val initialAuthors = initial.authors.map(::normalize).filter { it.isNotBlank() }.toSet()
+
+        return page.mapNotNull(::parseSearchCandidate)
+            .asSequence()
+            .filter { it.type == targetType }
+            .filter { normalize(it.title) == initialTitle }
+            .sortedByDescending { candidate ->
+                if (initialAuthors.isEmpty()) 0
+                else candidate.authors.map(::normalize).count { it in initialAuthors }
+            }
+            .firstOrNull()
+    }
+
+    private fun parseSearchCandidate(element: JsonElement): SearchCandidate? {
+        val obj = element as? JsonObject ?: return null
+        val type = when (obj["__typename"]?.jsonPrimitive?.contentOrNull) {
+            "TextBook" -> ResourceType.BOOK
+            "AudioBook" -> ResourceType.AUDIOBOOK
+            else -> return null
+        }
+        val book = obj["book"]?.jsonObject ?: return null
+        val id = book["uuid"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: return null
+        val title = book["name"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: return null
+        val cover = book["cover"]?.jsonObject?.get("url")?.jsonPrimitive?.contentOrNull
+        val authors = (book["authors"] as? JsonArray)
+            ?.mapNotNull { author ->
+                (author as? JsonObject)?.get("name")?.jsonPrimitive?.contentOrNull
+            }
+            .orEmpty()
+        return SearchCandidate(type, id, title, cover, authors)
+    }
+
+    private fun extractAuthors(resource: JsonObject): List<String> {
+        val candidates = listOf("authors_objects", "authors")
+        for (key in candidates) {
+            val array = resource[key] as? JsonArray ?: continue
+            val names = array.mapNotNull { item ->
+                when (item) {
+                    is JsonObject -> item["name"]?.jsonPrimitive?.contentOrNull
+                    is JsonPrimitive -> item.contentOrNull
+                    else -> null
+                }
+            }.filter { it.isNotBlank() }
+            if (names.isNotEmpty()) return names
+        }
+        return emptyList()
+    }
+
+    companion object {
+        private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+
+        fun makeWorkKey(title: String, authors: List<String> = emptyList()): String {
+            val authorPart = authors.firstOrNull().orEmpty()
+            return normalize("$title|$authorPart")
+        }
+
+        fun normalize(value: String): String = value
+            .lowercase(Locale.ROOT)
+            .replace('ё', 'е')
+            .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
+            .trim()
+            .replace(Regex("\\s+"), " ")
     }
 
     /**
@@ -148,13 +314,13 @@ class BookRepository(private val context: Context) {
 
         ZipFile(epub).use { zip ->
             val existing = zip.getEntry(coverEntryName)
-            if (existing != null && existing.size > MIN_VALID_COVER_BYTES) return
+            if (existing != null && existing.size > CoverRegexes.MIN_VALID_COVER_BYTES) return
         }
 
         val response = api.downloadByUrl(coverUrl, token)
         if (!response.isSuccessful) return
         val bytes = response.body()?.bytes() ?: return
-        if (bytes.size <= MIN_VALID_COVER_BYTES) return
+        if (bytes.size <= CoverRegexes.MIN_VALID_COVER_BYTES) return
 
         replaceZipEntry(epub, coverEntryName, bytes)
     }
@@ -164,14 +330,14 @@ class BookRepository(private val context: Context) {
             val container = zip.getEntry("META-INF/container.xml")
                 ?.let { entry -> zip.getInputStream(entry).bufferedReader().use { it.readText() } }
             val opfPath = container
-                ?.let { FULL_PATH_REGEX.find(it)?.groupValues?.getOrNull(1) }
+                ?.let { CoverRegexes.FULL_PATH_REGEX.find(it)?.groupValues?.getOrNull(1) }
                 ?: zip.entries().asSequence().firstOrNull { it.name.endsWith(".opf", true) }?.name
                 ?: return null
 
             val opfEntry = zip.getEntry(opfPath) ?: return null
             val opf = zip.getInputStream(opfEntry).bufferedReader().use { it.readText() }
 
-            val coverId = META_COVER_REGEX.find(opf)?.groupValues?.getOrNull(1)
+            val coverId = CoverRegexes.META_COVER_REGEX.find(opf)?.groupValues?.getOrNull(1)
             val href = when {
                 coverId != null -> findItemHrefById(opf, coverId)
                 else -> findEpub3CoverHref(opf)
@@ -195,23 +361,23 @@ class BookRepository(private val context: Context) {
     }
 
     private fun findItemHrefById(opf: String, id: String): String? {
-        val item = ITEM_TAG_REGEX.findAll(opf)
+        val item = CoverRegexes.ITEM_TAG_REGEX.findAll(opf)
             .map { it.value }
-            .firstOrNull { tag -> ID_ATTR_REGEX.find(tag)?.groupValues?.getOrNull(1) == id }
+            .firstOrNull { tag -> CoverRegexes.ID_ATTR_REGEX.find(tag)?.groupValues?.getOrNull(1) == id }
             ?: return null
-        return HREF_ATTR_REGEX.find(item)?.groupValues?.getOrNull(1)
+        return CoverRegexes.HREF_ATTR_REGEX.find(item)?.groupValues?.getOrNull(1)
     }
 
     private fun findEpub3CoverHref(opf: String): String? {
-        val item = ITEM_TAG_REGEX.findAll(opf)
+        val item = CoverRegexes.ITEM_TAG_REGEX.findAll(opf)
             .map { it.value }
             .firstOrNull { tag ->
-                PROPERTIES_ATTR_REGEX.find(tag)?.groupValues?.getOrNull(1)
+                CoverRegexes.PROPERTIES_ATTR_REGEX.find(tag)?.groupValues?.getOrNull(1)
                     ?.split(Regex("\\s+"))
                     ?.any { it == "cover-image" } == true
             }
             ?: return null
-        return HREF_ATTR_REGEX.find(item)?.groupValues?.getOrNull(1)
+        return CoverRegexes.HREF_ATTR_REGEX.find(item)?.groupValues?.getOrNull(1)
     }
 
     private fun replaceZipEntry(epub: File, targetEntry: String, replacement: ByteArray) {
@@ -261,7 +427,7 @@ class BookRepository(private val context: Context) {
     private fun String.toDirectM4aUrl(): String =
         replace(Regex("\\.m3u8(?=\\?|$)", RegexOption.IGNORE_CASE), ".m4a")
 
-    private companion object {
+    private object CoverRegexes {
         const val MIN_VALID_COVER_BYTES = 1024
         val FULL_PATH_REGEX = Regex("""full-path\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
         val META_COVER_REGEX = Regex(
@@ -274,3 +440,56 @@ class BookRepository(private val context: Context) {
         val PROPERTIES_ATTR_REGEX = Regex("""\bproperties\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
     }
 }
+
+
+private const val GQL_SEARCH = """
+query Search(${'$'}query: SearchParamsInput!) {
+  search(query: ${'$'}query) {
+    page {
+      __typename
+      ...searchSnippetAudioBookFragment
+      ...searchSnippetTextBookFragment
+      ...searchSnippetComicBookFragment
+      ...searchSnippetTextSerialFragment
+      ...bookshelfFragment
+      ...personFragment
+      ...publisherFragment
+      ...seriesFragment
+      ...topicFragment
+      ...userFragment
+    }
+    cursor
+    rankedFilter { filterType }
+    misspell { correctedText correctionType }
+  }
+}
+fragment coverFragment on Cover { url ratio backgroundColorHex }
+fragment personFragment on Person { avatar { __typename ...coverFragment } name uuid worksCount roles }
+fragment bookFragment on Book { annotation name cover { __typename ...coverFragment } uuid authors { __typename ...personFragment } ageRestriction editorAnnotation }
+fragment publisherFragment on Publisher { avatar { __typename ...coverFragment } name uuid worksCount }
+fragment publisherBookFragment on Book { publisher { __typename ...publisherFragment } }
+fragment translatorsBookFragment on Book { translators { __typename ...personFragment } }
+fragment topicsBookFragment on Book { topics { name totalBook uuid } }
+fragment subscriptionLevelsFragment on Book { subscriptionLevels }
+fragment snippetBookFragment on Book { __typename ...bookFragment ...publisherBookFragment ...translatorsBookFragment ...topicsBookFragment ...subscriptionLevelsFragment }
+fragment bookTagFragment on Tag { name value }
+fragment narratorsAudioBookFragment on AudioBook { narrators { __typename ...personFragment } }
+fragment progressFragment on Progress { finished inLibrary progress isPublic }
+fragment progressAudioBookFragment on AudioBook { progress { __typename ...progressFragment } }
+fragment listenersCountAudioBookFragment on AudioBook { listenersCount }
+fragment searchSnippetAudioBookFragment on AudioBook { __typename book { __typename ...snippetBookFragment tags { __typename ...bookTagFragment } } ...narratorsAudioBookFragment ...progressAudioBookFragment ...listenersCountAudioBookFragment }
+fragment progressTextBookFragment on TextBook { progress { __typename ...progressFragment } }
+fragment readersCountTextBookFragment on TextBook { readersCount }
+fragment searchSnippetTextBookFragment on TextBook { __typename book { __typename ...snippetBookFragment tags { __typename ...bookTagFragment } } ...progressTextBookFragment ...readersCountTextBookFragment }
+fragment progressComicBookFragment on ComicBook { progress { __typename ...progressFragment } }
+fragment readersCountComicBookFragment on ComicBook { readersCount }
+fragment searchSnippetComicBookFragment on ComicBook { __typename book { __typename ...snippetBookFragment tags { __typename ...bookTagFragment } } ...progressComicBookFragment ...readersCountComicBookFragment }
+fragment textSerialFragment on TextSerial { book { __typename ...bookFragment } }
+fragment episodesTextSerialFragment on TextSerial { episodes { total } }
+fragment readersCountTextSerialFragment on TextSerial { readersCount }
+fragment searchSnippetTextSerialFragment on TextSerial { __typename book { __typename ...snippetBookFragment tags { __typename ...bookTagFragment } } ...textSerialFragment ...episodesTextSerialFragment ...readersCountTextSerialFragment }
+fragment userFragment on User { avatar { __typename ...coverFragment } name uuid followersCount login }
+fragment bookshelfFragment on Bookshelf { cover { __typename ...coverFragment } name uuid user { __typename ...userFragment } posts { total } followersCount description }
+fragment seriesFragment on Series { authors { __typename ...personFragment } cover { __typename ...coverFragment } name uuid items { followersCount total } }
+fragment topicFragment on Topic { name slug totalBook uuid parent { name slug totalBook uuid } }
+"""

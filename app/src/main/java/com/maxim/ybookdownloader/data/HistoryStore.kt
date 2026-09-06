@@ -21,7 +21,11 @@ data class DownloadHistoryItem(
     val uri: String,
     val uris: List<String> = emptyList(),
     val displayPath: String,
-    val createdAt: Long = System.currentTimeMillis()
+    val createdAt: Long = System.currentTimeMillis(),
+    // v0.5.0: общий ключ связывает текстовую и аудиоверсию одного произведения.
+    // Для старой истории поле пустое; UI дополнительно умеет сопоставлять по названию.
+    val workKey: String = "",
+    val authors: String = ""
 )
 
 /**
