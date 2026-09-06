@@ -46,14 +46,18 @@ class BookRepository(private val context: Context) {
      * Пользовательский файл в Downloads создаёт BookExporter.
      * Так рабочая копия не пересекается с временными файлами конвертации.
      */
-    suspend fun downloadEpub(id: String, token: String): File {
-        val response = api.downloadEpub(id, token)
-        check(response.isSuccessful) { "Ошибка скачивания: HTTP ${response.code()}" }
-
+    suspend fun downloadEpub(id: String, token: String, force: Boolean = false): File {
         val booksDir = File(context.filesDir, "books").apply {
             if (!exists() && !mkdirs()) error("Не удалось создать внутренний каталог книг")
         }
         val file = File(booksDir, "$id.epub")
+
+        if (!force && file.exists() && file.length() > 0L) {
+            return file
+        }
+
+        val response = api.downloadEpub(id, token)
+        check(response.isSuccessful) { "Ошибка скачивания: HTTP ${response.code()}" }
 
         try {
             val body = response.body() ?: error("Пустой файл")
