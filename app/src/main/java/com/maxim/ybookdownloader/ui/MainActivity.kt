@@ -472,7 +472,12 @@ fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
             title = { Text("Формат файла") },
             text = {
                 Column {
-                    BookExporter.Format.entries.forEachIndexed { index, format ->
+                    // EPUB уже скачан и сохраняется основной кнопкой, поэтому
+                    // в меню конвертации показываем только другие форматы.
+                    val exportFormats = BookExporter.Format.entries
+                        .filter { it != BookExporter.Format.EPUB }
+
+                    exportFormats.forEachIndexed { index, format ->
                         TextButton(
                             onClick = {
                                 showFormats = false
@@ -482,7 +487,7 @@ fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
                         ) {
                             Text(format.label)
                         }
-                        if (index < BookExporter.Format.entries.lastIndex) {
+                        if (index < exportFormats.lastIndex) {
                             HorizontalDivider()
                         }
                     }
