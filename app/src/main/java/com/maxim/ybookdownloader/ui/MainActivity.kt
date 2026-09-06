@@ -14,6 +14,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,12 +32,12 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.MenuBook
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
@@ -44,7 +45,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -153,6 +154,25 @@ data class BookUiState(
 enum class AudioQuality(val label: String, val isMax: Boolean) {
     NORMAL("M4A • Обычное качество", false),
     MAX("M4A • Максимальное качество", true)
+}
+
+private fun compactChapterList(numbers: List<Int>): String {
+    val sorted = numbers.distinct().sorted()
+    if (sorted.isEmpty()) return ""
+    val ranges = mutableListOf<String>()
+    var start = sorted.first()
+    var previous = start
+    sorted.drop(1).forEach { current ->
+        if (current == previous + 1) {
+            previous = current
+        } else {
+            ranges += if (start == previous) "$start" else "$start–$previous"
+            start = current
+            previous = current
+        }
+    }
+    ranges += if (start == previous) "$start" else "$start–$previous"
+    return ranges.joinToString(", ")
 }
 
 class MainViewModel : ViewModel() {
@@ -426,7 +446,10 @@ class MainViewModel : ViewModel() {
                     uris = results.map { it.uri.toString() },
                     displayPath = displayPath,
                     workKey = state.workKey,
-                    authors = state.authors.joinToString(", ")
+                    authors = state.authors.joinToString(", "),
+                    chapterNumbers = selectedTracks.map { it.number },
+                    totalChapters = totalTracks,
+                    audioQuality = quality.label
                 )
                 history = historyStore.add(item)
                 state = state.copy(
@@ -455,20 +478,66 @@ class MainViewModel : ViewModel() {
     fun shareableDownloads(): List<DownloadHistoryItem> {
         val workKey = state.workKey
         val currentTitle = BookRepository.normalize(state.title.orEmpty())
-        return history
-            .asSequence()
-            .filter { item ->
-                (workKey.isNotBlank() && item.workKey == workKey) ||
-                    (item.workKey.isBlank() && BookRepository.normalize(item.title) == currentTitle)
+        val matching = history.filter { item ->
+            (workKey.isNotBlank() && item.workKey == workKey) ||
+                (item.workKey.isBlank() && BookRepository.normalize(item.title) == currentTitle)
+        }
+
+        val textItems = matching
+            .filter { it.resourceType != ResourceType.AUDIOBOOK.name }
+            .distinctBy { "${it.resourceType}|${it.format}" }
+
+        val audioItems = matching.filter { it.resourceType == ResourceType.AUDIOBOOK.name }
+        if (audioItems.isEmpty()) return textItems
+
+        // Несколько отдельных скачиваний одной аудиокниги показываем одним пунктом.
+        // Если главу скачивали повторно, при отправке используется самый свежий файл.
+        val latestByChapter = linkedMapOf<Int, String>()
+        val legacyUris = mutableListOf<String>()
+        audioItems.sortedByDescending { it.createdAt }.forEach { item ->
+            val itemUris = if (item.uris.isNotEmpty()) item.uris else listOf(item.uri)
+            if (item.chapterNumbers.isNotEmpty() && item.chapterNumbers.size == itemUris.size) {
+                item.chapterNumbers.zip(itemUris).forEach { (chapter, uri) ->
+                    latestByChapter.putIfAbsent(chapter, uri)
+                }
+            } else {
+                // История до v0.7.0 не содержала номера глав. Такие файлы тоже сохраняем.
+                legacyUris += itemUris
             }
-            .distinctBy { item ->
-                val normalizedFormat = item.format.replace(
-                    Regex("\\s*•\\s*\\d+\\s+файл.*$", RegexOption.IGNORE_CASE),
-                    ""
-                )
-                "${item.resourceType}|$normalizedFormat"
-            }
-            .toList()
+        }
+
+        val chapterNumbers = latestByChapter.keys.sorted()
+        val combinedUris = mutableListOf<String>().apply {
+            chapterNumbers.forEach { chapter -> latestByChapter[chapter]?.let(::add) }
+            legacyUris.distinct().filterNot { it in this }.forEach(::add)
+        }
+        if (combinedUris.isEmpty()) return textItems
+
+        val latest = audioItems.maxByOrNull { it.createdAt } ?: return textItems
+        val totalChapters = audioItems.maxOfOrNull { it.totalChapters } ?: 0
+        val qualities = audioItems.mapNotNull { it.audioQuality.takeIf { value -> value.isNotBlank() } }.distinct()
+        val qualityLabel = when {
+            qualities.size == 1 -> qualities.first()
+            qualities.isNotEmpty() -> "Смешанное качество"
+            else -> "M4A"
+        }
+        val countLabel = if (chapterNumbers.isNotEmpty()) {
+            if (totalChapters > 0) "${chapterNumbers.size} из $totalChapters глав" else "${chapterNumbers.size} глав"
+        } else {
+            "${combinedUris.size} файлов"
+        }
+
+        val audioCombined = latest.copy(
+            id = "combined-audio-${state.workKey.ifBlank { currentTitle }}",
+            format = "M4A • $countLabel",
+            uri = combinedUris.first(),
+            uris = combinedUris,
+            displayPath = "Все сохранённые главы аудиокниги",
+            chapterNumbers = chapterNumbers,
+            totalChapters = totalChapters,
+            audioQuality = qualityLabel
+        )
+        return textItems + audioCombined
     }
 
     fun shareHistoryItem(context: Context, item: DownloadHistoryItem) {
@@ -635,19 +704,20 @@ fun YBookApp(
             TopAppBar(
                 title = { Text("YBook Downloader") },
                 actions = {
-                    if (selectedSection == AppSection.HOME && state.title != null) {
-                        FilledIconButton(
-                            onClick = { openSearch() },
-                            enabled = !state.busy
-                        ) {
-                            Icon(Icons.Default.Add, contentDescription = "Добавить книгу")
-                        }
-                    }
                     IconButton(onClick = { showSettings = true }) {
                         Icon(Icons.Default.Settings, contentDescription = "Настройки")
                     }
                 }
             )
+        },
+        floatingActionButton = {
+            if (selectedSection == AppSection.HOME && state.title != null && !state.busy) {
+                FloatingActionButton(
+                    onClick = { openSearch() },
+                ) {
+                    Icon(Icons.Default.Search, contentDescription = "Найти другую книгу")
+                }
+            }
         },
         bottomBar = {
             NavigationBar {
@@ -849,6 +919,30 @@ private fun HomeScreen(
                     modifier = Modifier.padding(16.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
+                    Spacer(Modifier.height(18.dp))
+                    state.coverUrl?.let { cover ->
+                        AsyncImage(
+                            model = cover,
+                            contentDescription = "Обложка",
+                            modifier = Modifier.size(190.dp)
+                        )
+                    }
+                    Spacer(Modifier.height(14.dp))
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.headlineSmall,
+                        textAlign = TextAlign.Center
+                    )
+                    if (state.authors.isNotEmpty()) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            state.authors.joinToString(", "),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                    Spacer(Modifier.height(18.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -898,30 +992,7 @@ private fun HomeScreen(
                         }
                     }
 
-                    Spacer(Modifier.height(18.dp))
-                    state.coverUrl?.let { cover ->
-                        AsyncImage(
-                            model = cover,
-                            contentDescription = "Обложка",
-                            modifier = Modifier.size(190.dp)
-                        )
-                    }
-                    Spacer(Modifier.height(14.dp))
-                    Text(
-                        it,
-                        style = MaterialTheme.typography.headlineSmall,
-                        textAlign = TextAlign.Center
-                    )
-                    if (state.authors.isNotEmpty()) {
-                        Spacer(Modifier.height(6.dp))
-                        Text(
-                            state.authors.joinToString(", "),
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            textAlign = TextAlign.Center
-                        )
-                    }
-                    Spacer(Modifier.height(20.dp))
+                    Spacer(Modifier.height(16.dp))
                     Button(
                         onClick = onDownload,
                         enabled = !state.busy,
@@ -1014,6 +1085,13 @@ private fun HistoryCard(item: DownloadHistoryItem, onShare: () -> Unit) {
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                if (item.resourceType == ResourceType.AUDIOBOOK.name && item.chapterNumbers.isNotEmpty()) {
+                    Text(
+                        "Главы: ${compactChapterList(item.chapterNumbers)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
                 Text(
                     item.displayPath,
                     style = MaterialTheme.typography.bodySmall,
@@ -1244,11 +1322,20 @@ private fun SettingsDialog(
     onLogout: () -> Unit,
     onDismiss: () -> Unit
 ) {
+    val context = LocalContext.current
+    val versionName = remember(context) {
+        runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull() ?: "?"
+    }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Настройки") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
                 Text(
                     "Оформление",
                     style = MaterialTheme.typography.titleMedium,
@@ -1275,18 +1362,58 @@ private fun SettingsDialog(
                         }
                     }
                 }
+
                 HorizontalDivider(Modifier.padding(vertical = 6.dp))
-                TextButton(
+                OutlinedButton(
                     onClick = onLogout,
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("Выйти из Яндекс Книг")
+                    Text("Сбросить авторизацию Яндекс Книг")
+                }
+
+                HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Image(
+                        painter = painterResource(R.drawable.ic_launcher_art),
+                        contentDescription = "Иконка YBook Downloader",
+                        modifier = Modifier.size(56.dp)
+                    )
+                    Text(
+                        "YBook Downloader",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Text(
+                        "Версия $versionName",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    TextButton(
+                        onClick = {
+                            context.startActivity(
+                                Intent(
+                                    Intent.ACTION_VIEW,
+                                    Uri.parse("https://github.com/MAX-TAC/YBook-Downloader")
+                                )
+                            )
+                        }
+                    ) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_github),
+                            contentDescription = "GitHub",
+                            modifier = Modifier.size(22.dp)
+                        )
+                        Spacer(Modifier.size(8.dp))
+                        Text("GitHub")
+                    }
                 }
             }
         },
-        confirmButton = {
-            TextButton(onClick = onDismiss) { Text("Готово") }
-        }
+        confirmButton = {}
     )
 }
 
@@ -1310,6 +1437,13 @@ private fun ShareDownloadedDialog(
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
+                            if (item.resourceType == ResourceType.AUDIOBOOK.name && item.chapterNumbers.isNotEmpty()) {
+                                Text(
+                                    "Главы: ${compactChapterList(item.chapterNumbers)}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                         }
                     }
                     if (index < items.lastIndex) HorizontalDivider()

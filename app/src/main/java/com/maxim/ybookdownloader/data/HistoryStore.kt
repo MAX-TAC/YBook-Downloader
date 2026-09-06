@@ -25,7 +25,12 @@ data class DownloadHistoryItem(
     // v0.5.0: общий ключ связывает текстовую и аудиоверсию одного произведения.
     // Для старой истории поле пустое; UI дополнительно умеет сопоставлять по названию.
     val workKey: String = "",
-    val authors: String = ""
+    val authors: String = "",
+    // v0.7.0: для аудиокниг сохраняем конкретные номера глав, чтобы
+    // повторные скачивания можно было объединять при «Поделиться».
+    val chapterNumbers: List<Int> = emptyList(),
+    val totalChapters: Int = 0,
+    val audioQuality: String = ""
 )
 
 /**
