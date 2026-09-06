@@ -17,7 +17,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -32,6 +31,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -49,6 +50,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -57,6 +59,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil3.compose.AsyncImage
+import com.maxim.ybookdownloader.R
 import com.maxim.ybookdownloader.data.BookRepository
 import com.maxim.ybookdownloader.export.BookExporter
 import com.maxim.ybookdownloader.security.TokenStore
@@ -364,43 +367,41 @@ fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
                 modifier = Modifier.fillMaxWidth(),
                 label = { Text("Ссылка на книгу") },
                 minLines = 2,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri)
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                trailingIcon = {
+                    IconButton(
+                        onClick = {
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            val text = clipboard.primaryClip
+                                ?.getItemAt(0)
+                                ?.coerceToText(context)
+                                ?.toString()
+                                .orEmpty()
+                            if (text.isBlank()) {
+                                vm.showError("Буфер обмена пуст")
+                            } else {
+                                input = text
+                                vm.setUrl(text)
+                            }
+                        }
+                    ) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_content_paste_24),
+                            contentDescription = "Вставить из буфера обмена"
+                        )
+                    }
+                }
             )
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            Button(
+                onClick = {
+                    val ref = BookUrlParser.parse(input)
+                    if (ref == null) vm.showError("Не удалось распознать ссылку на книгу")
+                    else vm.loadBook(ref)
+                },
+                modifier = Modifier.fillMaxWidth()
             ) {
-                OutlinedButton(
-                    onClick = {
-                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        val text = clipboard.primaryClip
-                            ?.getItemAt(0)
-                            ?.coerceToText(context)
-                            ?.toString()
-                            .orEmpty()
-                        if (text.isBlank()) {
-                            vm.showError("Буфер обмена пуст")
-                        } else {
-                            input = text
-                            vm.setUrl(text)
-                        }
-                    },
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text("Вставить")
-                }
-
-                Button(
-                    onClick = {
-                        val ref = BookUrlParser.parse(input)
-                        if (ref == null) vm.showError("Не удалось распознать ссылку на книгу")
-                        else vm.loadBook(ref)
-                    },
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text("Найти книгу")
-                }
+                Text("Найти книгу")
             }
 
             state.error?.let {

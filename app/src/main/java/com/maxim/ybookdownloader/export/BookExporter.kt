@@ -20,7 +20,7 @@ import java.util.zip.ZipFile
 class BookExporter(private val context: Context) {
     enum class Format(val label: String, val extension: String, val mime: String) {
         EPUB("EPUB", "epub", "application/epub+zip"),
-        FB2("FB2", "fb2", "application/xml"),
+        FB2("FB2", "fb2", "application/x-fictionbook+xml"),
         PDF("PDF", "pdf", "application/pdf"),
         TXT("TXT", "txt", "text/plain")
     }
