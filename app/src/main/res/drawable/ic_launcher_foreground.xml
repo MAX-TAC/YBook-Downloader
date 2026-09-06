@@ -1,0 +1,9 @@
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Approved YBook Downloader artwork. Kept as a bitmap inside the adaptive icon
+         so Android can apply the user's launcher shape (circle/squircle/etc.). -->
+    <item>
+        <bitmap
+            android:src="@drawable/ic_launcher_art"
+            android:gravity="fill" />
+    </item>
+</layer-list>

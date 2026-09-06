@@ -50,6 +50,7 @@ class BookRepository(private val context: Context) {
 
     data class AudioTrack(
         val number: Int,
+        val title: String,
         val minUrl: String?,
         val maxUrl: String?
     )
@@ -284,8 +285,19 @@ class BookRepository(private val context: Context) {
                 ?.toDirectM4aUrl()
 
             if (minUrl == null && maxUrl == null) return@mapIndexedNotNull null
+
+            val title = sequenceOf(
+                track["title"]?.jsonPrimitive?.contentOrNull,
+                track["name"]?.jsonPrimitive?.contentOrNull,
+                track["caption"]?.jsonPrimitive?.contentOrNull,
+                track["chapter_title"]?.jsonPrimitive?.contentOrNull,
+                (track["part"] as? JsonObject)?.get("title")?.jsonPrimitive?.contentOrNull
+            ).firstOrNull { !it.isNullOrBlank() }?.trim()
+                ?: "Глава ${index + 1}"
+
             AudioTrack(
                 number = index + 1,
+                title = title,
                 minUrl = minUrl ?: maxUrl,
                 maxUrl = maxUrl ?: minUrl
             )

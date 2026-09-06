@@ -22,8 +22,11 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -38,9 +41,8 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Card
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.HorizontalDivider
@@ -52,6 +54,7 @@ import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
@@ -98,13 +101,23 @@ import java.util.Locale
 
 class MainActivity : ComponentActivity() {
     private val sharedText = mutableStateOf<String?>(null)
+    private val themeMode = mutableStateOf(ThemeMode.SYSTEM)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         sharedText.value = extractSharedText(intent)
+        val themeStore = ThemeStore(applicationContext)
+        themeMode.value = themeStore.get()
         setContent {
-            YBookTheme {
-                YBookApp(sharedText.value)
+            YBookTheme(themeMode.value) {
+                YBookApp(
+                    initialText = sharedText.value,
+                    themeMode = themeMode.value,
+                    onThemeModeChange = { mode ->
+                        themeStore.set(mode)
+                        themeMode.value = mode
+                    }
+                )
             }
         }
     }
@@ -319,9 +332,47 @@ class MainViewModel : ViewModel() {
         }
     }
 
-    fun downloadAudiobook(context: Context, quality: AudioQuality) {
+    fun loadAudiobookTracks(onLoaded: (List<BookRepository.AudioTrack>) -> Unit) {
         if (state.resourceType != ResourceType.AUDIOBOOK) {
             showError("Сначала выберите вкладку «Аудио»")
+            return
+        }
+        val id = state.bookId ?: return
+        val token = tokenStore.getToken() ?: run {
+            showError("Сессия Яндекса не найдена. Войдите заново.")
+            return
+        }
+
+        state = state.copy(busy = true, error = null, message = null, progressLabel = "Получение списка глав…")
+        viewModelScope.launch {
+            runCatching { withContext(Dispatchers.IO) { repository.getAudiobookTracks(id, token) } }
+                .onSuccess { tracks ->
+                    state = state.copy(busy = false, progressLabel = null)
+                    if (tracks.isEmpty()) showError("В аудиокниге не найдены доступные главы")
+                    else onLoaded(tracks)
+                }
+                .onFailure {
+                    state = state.copy(
+                        busy = false,
+                        progressLabel = null,
+                        error = it.message ?: "Не удалось получить список глав"
+                    )
+                }
+        }
+    }
+
+    fun downloadAudiobook(
+        context: Context,
+        quality: AudioQuality,
+        selectedTracks: List<BookRepository.AudioTrack>,
+        totalTracks: Int
+    ) {
+        if (state.resourceType != ResourceType.AUDIOBOOK) {
+            showError("Сначала выберите вкладку «Аудио»")
+            return
+        }
+        if (selectedTracks.isEmpty()) {
+            showError("Выберите хотя бы одну главу")
             return
         }
         val id = state.bookId ?: return
@@ -331,25 +382,25 @@ class MainViewModel : ViewModel() {
             return
         }
 
-        state = state.copy(busy = true, error = null, message = null, progressLabel = "Получение списка дорожек…")
+        state = state.copy(busy = true, error = null, message = null, progressLabel = "Подготовка скачивания…")
         viewModelScope.launch {
             try {
-                val tracks = withContext(Dispatchers.IO) { repository.getAudiobookTracks(id, token) }
-                check(tracks.isNotEmpty()) { "В аудиокниге не найдены доступные дорожки" }
                 val exporter = AudioExporter(context.applicationContext)
                 val results = mutableListOf<AudioExporter.ExportResult>()
 
-                tracks.forEachIndexed { index, track ->
-                    state = state.copy(progressLabel = "Скачивание дорожки ${index + 1} из ${tracks.size}…")
+                selectedTracks.forEachIndexed { index, track ->
+                    state = state.copy(
+                        progressLabel = "Скачивание главы ${index + 1} из ${selectedTracks.size}: ${track.title}"
+                    )
                     val url = (if (quality.isMax) track.maxUrl else track.minUrl)
-                        ?: error("Для дорожки ${index + 1} нет ссылки выбранного качества")
+                        ?: error("Для главы ${track.number} нет ссылки выбранного качества")
 
                     val result = withContext(Dispatchers.IO) {
                         val workDir = File(context.cacheDir, "audio_work").apply { mkdirs() }
                         val temp = File(workDir, "$id-${track.number}.m4a")
                         try {
                             repository.downloadAudioTrack(url, token, temp)
-                            exporter.saveTrack(temp, title, track.number, tracks.size)
+                            exporter.saveTrack(temp, title, track.number, totalTracks)
                         } finally {
                             temp.delete()
                         }
@@ -369,7 +420,7 @@ class MainViewModel : ViewModel() {
                     coverUrl = state.coverUrl,
                     sourceUrl = state.url,
                     resourceType = ResourceType.AUDIOBOOK.name,
-                    format = "${quality.label} • ${results.size} файл(ов)",
+                    format = "${quality.label} • ${results.size} из $totalTracks глав",
                     mime = AudioExporter.MIME_M4A,
                     uri = results.first().uri.toString(),
                     uris = results.map { it.uri.toString() },
@@ -381,7 +432,11 @@ class MainViewModel : ViewModel() {
                 state = state.copy(
                     busy = false,
                     progressLabel = null,
-                    message = "Аудиокнига сохранена: $displayPath"
+                    message = if (results.size == totalTracks) {
+                        "Аудиокнига сохранена: $displayPath"
+                    } else {
+                        "Сохранено глав: ${results.size} из $totalTracks"
+                    }
                 )
             } catch (e: Exception) {
                 state = state.copy(
@@ -487,7 +542,12 @@ private enum class AppSection { HOME, HISTORY }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
+fun YBookApp(
+    initialText: String?,
+    themeMode: ThemeMode,
+    onThemeModeChange: (ThemeMode) -> Unit,
+    vm: MainViewModel = viewModel()
+) {
     val context = LocalContext.current
     vm.init(context)
 
@@ -496,8 +556,11 @@ fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
     var showSearchDialog by remember { mutableStateOf(false) }
     var showFormats by remember { mutableStateOf(false) }
     var showAudioQuality by remember { mutableStateOf(false) }
+    var showAudioChapters by remember { mutableStateOf(false) }
+    var pendingAudioQuality by remember { mutableStateOf(AudioQuality.MAX) }
+    var audioTracks by remember { mutableStateOf<List<BookRepository.AudioTrack>>(emptyList()) }
     var showShareDialog by remember { mutableStateOf(false) }
-    var settingsExpanded by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(false) }
     var searchInput by remember { mutableStateOf("") }
     var pendingStorageAction by remember { mutableStateOf<(() -> Unit)?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
@@ -580,23 +643,8 @@ fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
                             Icon(Icons.Default.Add, contentDescription = "Добавить книгу")
                         }
                     }
-                    Box {
-                        IconButton(onClick = { settingsExpanded = true }) {
-                            Icon(Icons.Default.Settings, contentDescription = "Настройки")
-                        }
-                        DropdownMenu(
-                            expanded = settingsExpanded,
-                            onDismissRequest = { settingsExpanded = false }
-                        ) {
-                            DropdownMenuItem(
-                                text = { Text("Выйти из Яндекс Книг") },
-                                onClick = {
-                                    settingsExpanded = false
-                                    vm.logout()
-                                    authenticated = false
-                                }
-                            )
-                        }
+                    IconButton(onClick = { showSettings = true }) {
+                        Icon(Icons.Default.Settings, contentDescription = "Настройки")
                     }
                 }
             )
@@ -686,8 +734,44 @@ fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
             onDismiss = { showAudioQuality = false },
             onSelect = { quality ->
                 showAudioQuality = false
-                runWithStorageAccess { vm.downloadAudiobook(context, quality) }
+                pendingAudioQuality = quality
+                vm.loadAudiobookTracks { tracks ->
+                    audioTracks = tracks
+                    showAudioChapters = true
+                }
             }
+        )
+    }
+
+    if (showAudioChapters) {
+        AudioChapterDialog(
+            tracks = audioTracks,
+            quality = pendingAudioQuality,
+            onDismiss = { showAudioChapters = false },
+            onDownload = { selected ->
+                showAudioChapters = false
+                runWithStorageAccess {
+                    vm.downloadAudiobook(
+                        context = context,
+                        quality = pendingAudioQuality,
+                        selectedTracks = selected,
+                        totalTracks = audioTracks.size
+                    )
+                }
+            }
+        )
+    }
+
+    if (showSettings) {
+        SettingsDialog(
+            themeMode = themeMode,
+            onThemeModeChange = onThemeModeChange,
+            onLogout = {
+                showSettings = false
+                vm.logout()
+                authenticated = false
+            },
+            onDismiss = { showSettings = false }
         )
     }
 
@@ -1052,6 +1136,157 @@ private fun AudioQualityDialog(
         },
         confirmButton = {},
         dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } }
+    )
+}
+
+
+@Composable
+private fun AudioChapterDialog(
+    tracks: List<BookRepository.AudioTrack>,
+    quality: AudioQuality,
+    onDismiss: () -> Unit,
+    onDownload: (List<BookRepository.AudioTrack>) -> Unit
+) {
+    var selectedNumbers by remember(tracks) {
+        mutableStateOf(tracks.map { it.number }.toSet())
+    }
+    val allSelected = tracks.isNotEmpty() && selectedNumbers.size == tracks.size
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Выберите главы") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    quality.label,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "Выбрано: ${selectedNumbers.size} из ${tracks.size}",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    TextButton(
+                        onClick = {
+                            selectedNumbers = if (allSelected) emptySet()
+                            else tracks.map { it.number }.toSet()
+                        }
+                    ) {
+                        Text(if (allSelected) "Снять все" else "Выбрать все")
+                    }
+                }
+                HorizontalDivider()
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 420.dp)
+                ) {
+                    items(tracks, key = { it.number }) { track ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked = track.number in selectedNumbers,
+                                onCheckedChange = { checked ->
+                                    selectedNumbers = if (checked) {
+                                        selectedNumbers + track.number
+                                    } else {
+                                        selectedNumbers - track.number
+                                    }
+                                }
+                            )
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                Text(
+                                    "Глава ${track.number}",
+                                    style = MaterialTheme.typography.titleSmall
+                                )
+                                if (!track.title.equals("Глава ${track.number}", ignoreCase = true)) {
+                                    Text(
+                                        track.title,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 2
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    onDownload(tracks.filter { it.number in selectedNumbers })
+                },
+                enabled = selectedNumbers.isNotEmpty()
+            ) {
+                Text("Скачать")
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } }
+    )
+}
+
+@Composable
+private fun SettingsDialog(
+    themeMode: ThemeMode,
+    onThemeModeChange: (ThemeMode) -> Unit,
+    onLogout: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Настройки") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    "Оформление",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Medium
+                )
+                ThemeMode.entries.forEach { mode ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = themeMode == mode,
+                            onClick = { onThemeModeChange(mode) }
+                        )
+                        TextButton(
+                            onClick = { onThemeModeChange(mode) },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(
+                                mode.label,
+                                modifier = Modifier.fillMaxWidth(),
+                                textAlign = TextAlign.Start
+                            )
+                        }
+                    }
+                }
+                HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                TextButton(
+                    onClick = onLogout,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Выйти из Яндекс Книг")
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Готово") }
+        }
     )
 }
 

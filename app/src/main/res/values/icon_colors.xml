@@ -1,0 +1,4 @@
+<resources>
+    <!-- Dark navy matches the transparent outer corners of the approved artwork. -->
+    <color name="ic_launcher_background">#07184F</color>
+</resources>

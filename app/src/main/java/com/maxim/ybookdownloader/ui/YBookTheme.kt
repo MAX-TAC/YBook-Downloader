@@ -11,8 +11,16 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.platform.LocalContext
 
 @Composable
-fun YBookTheme(content: @Composable () -> Unit) {
-    val darkTheme = isSystemInDarkTheme()
+fun YBookTheme(
+    themeMode: ThemeMode = ThemeMode.SYSTEM,
+    content: @Composable () -> Unit
+) {
+    val systemDark = isSystemInDarkTheme()
+    val darkTheme = when (themeMode) {
+        ThemeMode.SYSTEM -> systemDark
+        ThemeMode.LIGHT -> false
+        ThemeMode.DARK -> true
+    }
     val context = LocalContext.current
 
     val colors = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
