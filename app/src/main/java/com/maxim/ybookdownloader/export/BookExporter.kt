@@ -57,13 +57,22 @@ class BookExporter(private val context: Context) {
         }
     }
 
-    /** URI внутренней рабочей копии EPUB для передачи Kindle/другому приложению. */
-    fun uriForSharing(epub: File): Uri {
+    /**
+     * Создаёт копию EPUB с нормальным именем книги для Android Share.
+     * Внутренняя рабочая копия называется по ID ресурса, поэтому напрямую
+     * передавать её нельзя — внешние приложения видели бы GUID вместо названия.
+     */
+    fun uriForSharing(epub: File, title: String): Uri {
         check(epub.exists()) { "EPUB не найден. Скачайте книгу заново." }
+        val shareDir = File(context.cacheDir, "share").apply {
+            if (!exists() && !mkdirs()) error("Не удалось подготовить каталог для отправки")
+        }
+        val shared = File(shareDir, "${safeName(title)}.epub")
+        epub.copyTo(shared, overwrite = true)
         return FileProvider.getUriForFile(
             context,
             "${context.packageName}.fileprovider",
-            epub
+            shared
         )
     }
 

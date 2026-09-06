@@ -29,6 +29,8 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Settings
@@ -79,10 +81,12 @@ import com.maxim.ybookdownloader.R
 import com.maxim.ybookdownloader.data.BookRepository
 import com.maxim.ybookdownloader.data.DownloadHistoryItem
 import com.maxim.ybookdownloader.data.HistoryStore
+import com.maxim.ybookdownloader.export.AudioExporter
 import com.maxim.ybookdownloader.export.BookExporter
 import com.maxim.ybookdownloader.security.TokenStore
 import com.maxim.ybookdownloader.util.BookReference
 import com.maxim.ybookdownloader.util.BookUrlParser
+import com.maxim.ybookdownloader.util.ResourceType
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -121,10 +125,19 @@ data class BookUiState(
     val title: String? = null,
     val coverUrl: String? = null,
     val bookId: String? = null,
+    val resourceType: ResourceType? = null,
     val error: String? = null,
     val message: String? = null,
+    val progressLabel: String? = null,
     val busy: Boolean = false
 )
+
+enum class AudioQuality(val label: String, val isMax: Boolean) {
+    NORMAL("M4A • Обычное качество", false),
+    MAX("M4A • Максимальное качество", true)
+}
+
+private enum class AudioAction { DOWNLOAD, SHARE }
 
 class MainViewModel : ViewModel() {
     private lateinit var repository: BookRepository
@@ -167,7 +180,7 @@ class MainViewModel : ViewModel() {
         setUrl(text)
         val reference = BookUrlParser.parse(text)
         if (reference == null) {
-            showError("Не удалось распознать ссылку на книгу")
+            showError("Не удалось распознать ссылку на книгу или аудиокнигу")
         } else {
             loadBook(reference)
         }
@@ -184,25 +197,30 @@ class MainViewModel : ViewModel() {
             busy = true,
             error = null,
             message = null,
+            progressLabel = if (ref.type == ResourceType.AUDIOBOOK) "Получение аудиокниги…" else "Получение книги…",
             bookId = ref.id,
+            resourceType = ref.type,
             title = null,
             coverUrl = null
         )
         epubFile = null
 
         viewModelScope.launch {
-            runCatching { repository.getBookInfo(ref.id, token) }
+            runCatching { repository.getResourceInfo(ref, token) }
                 .onSuccess { info ->
                     currentTitle = info.title
                     state = state.copy(
                         busy = false,
+                        progressLabel = null,
                         title = info.title,
-                        coverUrl = info.coverUrl
+                        coverUrl = info.coverUrl,
+                        resourceType = info.type
                     )
                 }
                 .onFailure {
                     state = state.copy(
                         busy = false,
+                        progressLabel = null,
                         error = it.message ?: "Не удалось получить книгу"
                     )
                 }
@@ -210,6 +228,10 @@ class MainViewModel : ViewModel() {
     }
 
     fun download(context: Context, format: BookExporter.Format) {
+        if (state.resourceType != ResourceType.BOOK) {
+            showError("Для аудиокниги выберите качество M4A")
+            return
+        }
         val id = state.bookId ?: return
         val title = state.title ?: "book"
         val token = tokenStore.getToken() ?: run {
@@ -217,17 +239,17 @@ class MainViewModel : ViewModel() {
             return
         }
 
-        state = state.copy(busy = true, error = null, message = null)
+        state = state.copy(busy = true, error = null, message = null, progressLabel = "Подготовка EPUB…")
         viewModelScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
                     val workingFile = epubFile?.takeIf { it.exists() }
-                        ?: repository.downloadEpub(id, token)
+                        ?: repository.downloadEpub(id, token, state.coverUrl)
                     val exporter = BookExporter(context.applicationContext)
                     val result = exporter.export(workingFile, title, format)
-                    Triple(workingFile, exporter, result)
+                    Pair(workingFile, result)
                 }
-            }.onSuccess { (file, _, result) ->
+            }.onSuccess { (file, result) ->
                 epubFile = file
                 currentTitle = title
                 val item = DownloadHistoryItem(
@@ -235,6 +257,7 @@ class MainViewModel : ViewModel() {
                     title = title,
                     coverUrl = state.coverUrl,
                     sourceUrl = state.url,
+                    resourceType = ResourceType.BOOK.name,
                     format = format.label,
                     mime = format.mime,
                     uri = result.uri.toString(),
@@ -243,18 +266,89 @@ class MainViewModel : ViewModel() {
                 history = historyStore.add(item)
                 state = state.copy(
                     busy = false,
+                    progressLabel = null,
                     message = "Сохранено: ${result.displayPath}"
                 )
             }.onFailure {
                 state = state.copy(
                     busy = false,
+                    progressLabel = null,
                     error = it.message ?: "Ошибка сохранения"
                 )
             }
         }
     }
 
-    fun shareCurrent(context: Context) {
+    fun downloadAudiobook(context: Context, quality: AudioQuality) {
+        if (state.resourceType != ResourceType.AUDIOBOOK) return
+        val id = state.bookId ?: return
+        val title = state.title ?: "audiobook"
+        val token = tokenStore.getToken() ?: run {
+            showError("Сессия Яндекса не найдена. Войдите заново.")
+            return
+        }
+
+        state = state.copy(busy = true, error = null, message = null, progressLabel = "Получение списка дорожек…")
+        viewModelScope.launch {
+            try {
+                val tracks = withContext(Dispatchers.IO) { repository.getAudiobookTracks(id, token) }
+                check(tracks.isNotEmpty()) { "В аудиокниге не найдены доступные дорожки" }
+                val exporter = AudioExporter(context.applicationContext)
+                val results = mutableListOf<AudioExporter.ExportResult>()
+
+                tracks.forEachIndexed { index, track ->
+                    state = state.copy(progressLabel = "Скачивание дорожки ${index + 1} из ${tracks.size}…")
+                    val url = (if (quality.isMax) track.maxUrl else track.minUrl)
+                        ?: error("Для дорожки ${index + 1} нет ссылки выбранного качества")
+
+                    val result = withContext(Dispatchers.IO) {
+                        val workDir = File(context.cacheDir, "audio_work").apply { mkdirs() }
+                        val temp = File(workDir, "$id-${track.number}.m4a")
+                        try {
+                            repository.downloadAudioTrack(url, token, temp)
+                            exporter.saveTrack(temp, title, track.number, tracks.size)
+                        } finally {
+                            temp.delete()
+                        }
+                    }
+                    results += result
+                }
+
+                val safeTitle = AudioExporter.safeName(title)
+                val displayPath = if (results.size == 1) {
+                    results.first().displayPath
+                } else {
+                    "Загрузки/YBook Downloader/$safeTitle/ (${results.size} файлов)"
+                }
+                val item = DownloadHistoryItem(
+                    bookId = id,
+                    title = title,
+                    coverUrl = state.coverUrl,
+                    sourceUrl = state.url,
+                    resourceType = ResourceType.AUDIOBOOK.name,
+                    format = "${quality.label} • ${results.size} файл(ов)",
+                    mime = AudioExporter.MIME_M4A,
+                    uri = results.first().uri.toString(),
+                    uris = results.map { it.uri.toString() },
+                    displayPath = displayPath
+                )
+                history = historyStore.add(item)
+                state = state.copy(
+                    busy = false,
+                    progressLabel = null,
+                    message = "Аудиокнига сохранена: $displayPath"
+                )
+            } catch (e: Exception) {
+                state = state.copy(
+                    busy = false,
+                    progressLabel = null,
+                    error = e.message ?: "Ошибка скачивания аудиокниги"
+                )
+            }
+        }
+    }
+
+    fun shareCurrentBook(context: Context) {
         val id = state.bookId ?: return
         val title = state.title ?: "book"
         val token = tokenStore.getToken() ?: run {
@@ -262,19 +356,19 @@ class MainViewModel : ViewModel() {
             return
         }
 
-        state = state.copy(busy = true, error = null, message = null)
+        state = state.copy(busy = true, error = null, message = null, progressLabel = "Подготовка книги…")
         viewModelScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
                     epubFile?.takeIf { it.exists() }
-                        ?: repository.downloadEpub(id, token)
+                        ?: repository.downloadEpub(id, token, state.coverUrl)
                 }
             }.onSuccess { file ->
                 epubFile = file
                 currentTitle = title
-                state = state.copy(busy = false)
+                state = state.copy(busy = false, progressLabel = null)
                 runCatching {
-                    val uri = BookExporter(context.applicationContext).uriForSharing(file)
+                    val uri = BookExporter(context.applicationContext).uriForSharing(file, title)
                     shareUri(context, uri, BookExporter.Format.EPUB.mime, "Поделиться книгой")
                 }.onFailure {
                     showError(it.message ?: "Ошибка подготовки книги")
@@ -282,7 +376,54 @@ class MainViewModel : ViewModel() {
             }.onFailure {
                 state = state.copy(
                     busy = false,
+                    progressLabel = null,
                     error = it.message ?: "Ошибка скачивания"
+                )
+            }
+        }
+    }
+
+    fun shareAudiobook(context: Context, quality: AudioQuality) {
+        if (state.resourceType != ResourceType.AUDIOBOOK) return
+        val id = state.bookId ?: return
+        val title = state.title ?: "audiobook"
+        val token = tokenStore.getToken() ?: run {
+            showError("Сессия Яндекса не найдена. Войдите заново.")
+            return
+        }
+
+        state = state.copy(busy = true, error = null, message = null, progressLabel = "Получение списка дорожек…")
+        viewModelScope.launch {
+            try {
+                val tracks = withContext(Dispatchers.IO) { repository.getAudiobookTracks(id, token) }
+                check(tracks.isNotEmpty()) { "В аудиокниге не найдены доступные дорожки" }
+                val exporter = AudioExporter(context.applicationContext)
+                val uris = mutableListOf<Uri>()
+
+                tracks.forEachIndexed { index, track ->
+                    state = state.copy(progressLabel = "Подготовка дорожки ${index + 1} из ${tracks.size}…")
+                    val url = (if (quality.isMax) track.maxUrl else track.minUrl)
+                        ?: error("Для дорожки ${index + 1} нет ссылки выбранного качества")
+                    val uri = withContext(Dispatchers.IO) {
+                        val workDir = File(context.cacheDir, "audio_work").apply { mkdirs() }
+                        val temp = File(workDir, "$id-${track.number}.m4a")
+                        try {
+                            repository.downloadAudioTrack(url, token, temp)
+                            exporter.uriForSharing(temp, title, track.number, tracks.size)
+                        } finally {
+                            temp.delete()
+                        }
+                    }
+                    uris += uri
+                }
+
+                state = state.copy(busy = false, progressLabel = null)
+                shareUris(context, uris, AudioExporter.MIME_M4A, "Поделиться аудиокнигой")
+            } catch (e: Exception) {
+                state = state.copy(
+                    busy = false,
+                    progressLabel = null,
+                    error = e.message ?: "Ошибка подготовки аудиокниги"
                 )
             }
         }
@@ -290,12 +431,18 @@ class MainViewModel : ViewModel() {
 
     fun shareHistoryItem(context: Context, item: DownloadHistoryItem) {
         runCatching {
-            shareUri(
-                context,
-                Uri.parse(item.uri),
-                item.mime,
-                "Поделиться книгой"
-            )
+            val all = if (item.uris.isNotEmpty()) item.uris else listOf(item.uri)
+            val parsed = all.map(Uri::parse)
+            if (parsed.size == 1) {
+                shareUri(
+                    context,
+                    parsed.first(),
+                    item.mime,
+                    if (item.resourceType == ResourceType.AUDIOBOOK.name) "Поделиться аудиокнигой" else "Поделиться книгой"
+                )
+            } else {
+                shareUris(context, parsed, item.mime, "Поделиться аудиокнигой")
+            }
         }.onFailure {
             showError("Не удалось открыть сохранённый файл. Возможно, он был удалён из памяти устройства.")
         }
@@ -319,7 +466,26 @@ class MainViewModel : ViewModel() {
             type = mime
             putExtra(Intent.EXTRA_STREAM, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            clipData = ClipData.newRawUri("Book", uri)
+            clipData = ClipData.newRawUri("YBook", uri)
+        }
+        context.startActivity(Intent.createChooser(intent, chooserTitle))
+    }
+
+    private fun shareUris(context: Context, uris: List<Uri>, mime: String, chooserTitle: String) {
+        check(uris.isNotEmpty()) { "Нет файлов для отправки" }
+        if (uris.size == 1) {
+            shareUri(context, uris.first(), mime, chooserTitle)
+            return
+        }
+
+        val clip = ClipData.newRawUri("YBook", uris.first()).apply {
+            uris.drop(1).forEach { addItem(ClipData.Item(it)) }
+        }
+        val intent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+            type = mime
+            putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            clipData = clip
         }
         context.startActivity(Intent.createChooser(intent, chooserTitle))
     }
@@ -337,6 +503,8 @@ fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
     var selectedSection by remember { mutableStateOf(AppSection.HOME) }
     var showSearchDialog by remember { mutableStateOf(false) }
     var showFormats by remember { mutableStateOf(false) }
+    var showAudioQuality by remember { mutableStateOf(false) }
+    var audioAction by remember { mutableStateOf(AudioAction.DOWNLOAD) }
     var settingsExpanded by remember { mutableStateOf(false) }
     var searchInput by remember { mutableStateOf("") }
     var pendingStorageAction by remember { mutableStateOf<(() -> Unit)?>(null) }
@@ -419,7 +587,7 @@ fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
                             onClick = { openSearch() },
                             enabled = !state.busy
                         ) {
-                            Icon(Icons.Default.Add, contentDescription = "Найти другую книгу")
+                            Icon(Icons.Default.Add, contentDescription = "Добавить книгу или аудиокнигу")
                         }
                     }
                     Box {
@@ -466,8 +634,22 @@ fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
                 modifier = Modifier.padding(padding),
                 state = state,
                 onSearch = { openSearch() },
-                onDownload = { showFormats = true },
-                onShare = { vm.shareCurrent(context) }
+                onDownload = {
+                    if (state.resourceType == ResourceType.AUDIOBOOK) {
+                        audioAction = AudioAction.DOWNLOAD
+                        showAudioQuality = true
+                    } else {
+                        showFormats = true
+                    }
+                },
+                onShare = {
+                    if (state.resourceType == ResourceType.AUDIOBOOK) {
+                        audioAction = AudioAction.SHARE
+                        showAudioQuality = true
+                    } else {
+                        vm.shareCurrentBook(context)
+                    }
+                }
             )
 
             AppSection.HISTORY -> HistoryScreen(
@@ -501,7 +683,7 @@ fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
             onSearch = {
                 val ref = BookUrlParser.parse(searchInput)
                 if (ref == null) {
-                    vm.showError("Не удалось распознать ссылку на книгу")
+                    vm.showError("Не удалось распознать ссылку на книгу или аудиокнигу")
                 } else {
                     vm.setUrl(searchInput)
                     showSearchDialog = false
@@ -518,6 +700,20 @@ fun YBookApp(initialText: String?, vm: MainViewModel = viewModel()) {
             onSelect = { format ->
                 showFormats = false
                 runWithStorageAccess { vm.download(context, format) }
+            }
+        )
+    }
+
+    if (showAudioQuality) {
+        AudioQualityDialog(
+            action = audioAction,
+            onDismiss = { showAudioQuality = false },
+            onSelect = { quality ->
+                showAudioQuality = false
+                when (audioAction) {
+                    AudioAction.DOWNLOAD -> runWithStorageAccess { vm.downloadAudiobook(context, quality) }
+                    AudioAction.SHARE -> vm.shareAudiobook(context, quality)
+                }
             }
         )
     }
@@ -540,6 +736,13 @@ private fun HomeScreen(
     ) {
         if (state.busy) {
             LinearProgressIndicator(Modifier.fillMaxWidth())
+            state.progressLabel?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         }
 
         val title = state.title
@@ -557,12 +760,12 @@ private fun HomeScreen(
                         verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
                         Text(
-                            "Найдите книгу",
+                            "Найдите книгу или аудиокнигу",
                             style = MaterialTheme.typography.headlineSmall,
                             textAlign = TextAlign.Center
                         )
                         Text(
-                            "Используйте ссылку, полученную через «Поделиться» в приложении «Яндекс Книги».",
+                            "Используйте ссылку на книгу или аудиокнигу, полученную через «Поделиться» в приложении «Яндекс Книги».",
                             style = MaterialTheme.typography.bodyMedium,
                             textAlign = TextAlign.Center
                         )
@@ -570,7 +773,7 @@ private fun HomeScreen(
                             onClick = onSearch,
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            Text("Найти книгу")
+                            Text("Найти")
                         }
                     }
                 }
@@ -591,6 +794,20 @@ private fun HomeScreen(
                         )
                     }
                     Spacer(Modifier.height(14.dp))
+                    if (state.resourceType == ResourceType.AUDIOBOOK) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(Icons.Default.Headphones, contentDescription = null)
+                            Text(
+                                "Аудиокнига",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Spacer(Modifier.height(8.dp))
+                    }
                     Text(
                         it,
                         style = MaterialTheme.typography.headlineSmall,
@@ -648,7 +865,7 @@ private fun HistoryScreen(
         if (items.isEmpty()) {
             Card(Modifier.fillMaxWidth()) {
                 Text(
-                    "Здесь появятся книги, которые вы сохранили на устройство.",
+                    "Здесь появятся книги и аудиокниги, которые вы сохранили на устройство.",
                     modifier = Modifier.padding(20.dp),
                     style = MaterialTheme.typography.bodyMedium
                 )
@@ -715,7 +932,7 @@ private fun SearchBookDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Найти книгу") },
+        title = { Text("Найти книгу или аудиокнигу") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedTextField(
@@ -723,18 +940,27 @@ private fun SearchBookDialog(
                     onValueChange = onValueChange,
                     modifier = Modifier.fillMaxWidth(),
                     label = { Text("Ссылка из Яндекс Книг") },
-                    placeholder = { Text("https://books.yandex.ru/books/…") },
+                    placeholder = { Text("https://books.yandex.ru/books/… или /audiobooks/…") },
                     supportingText = {
-                        Text("Вставьте ссылку, полученную через «Поделиться» в приложении «Яндекс Книги».")
+                        Text("Вставьте ссылку на книгу или аудиокнигу, полученную через «Поделиться» в приложении «Яндекс Книги».")
                     },
                     minLines = 2,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                     trailingIcon = {
-                        IconButton(onClick = onPaste, enabled = !busy) {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_content_paste_24),
-                                contentDescription = "Вставить из буфера обмена"
-                            )
+                        if (value.isBlank()) {
+                            IconButton(onClick = onPaste, enabled = !busy) {
+                                Icon(
+                                    painter = painterResource(R.drawable.ic_content_paste_24),
+                                    contentDescription = "Вставить из буфера обмена"
+                                )
+                            }
+                        } else {
+                            IconButton(onClick = { onValueChange("") }, enabled = !busy) {
+                                Icon(
+                                    Icons.Default.Clear,
+                                    contentDescription = "Очистить ссылку"
+                                )
+                            }
                         }
                     }
                 )
@@ -788,6 +1014,47 @@ private fun DownloadFormatDialog(
                     if (index < BookExporter.Format.entries.lastIndex) {
                         HorizontalDivider()
                     }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Отмена") }
+        }
+    )
+}
+
+@Composable
+private fun AudioQualityDialog(
+    action: AudioAction,
+    onDismiss: () -> Unit,
+    onSelect: (AudioQuality) -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(if (action == AudioAction.DOWNLOAD) "Скачать аудиокнигу" else "Поделиться аудиокнигой")
+        },
+        text = {
+            Column {
+                AudioQuality.entries.forEachIndexed { index, quality ->
+                    TextButton(
+                        onClick = { onSelect(quality) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalAlignment = Alignment.Start
+                        ) {
+                            Text(quality.label, fontWeight = FontWeight.Medium)
+                            Text(
+                                if (quality.isMax) "Лучшее качество, больший размер файлов" else "Меньший размер файлов",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                    if (index < AudioQuality.entries.lastIndex) HorizontalDivider()
                 }
             }
         },

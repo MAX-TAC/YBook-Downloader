@@ -5,6 +5,7 @@ import retrofit2.Response
 import retrofit2.http.GET
 import retrofit2.http.Header
 import retrofit2.http.Path
+import retrofit2.http.Url
 
 interface BookmateApi {
     @GET("books/{uuid}")
@@ -17,6 +18,27 @@ interface BookmateApi {
     @GET("books/{uuid}/content/v4")
     suspend fun downloadEpub(
         @Path("uuid") uuid: String,
+        @Header("auth-token") token: String,
+        @Header("app-user-agent") appUserAgent: String = BookmateApiFactory.APP_USER_AGENT
+    ): Response<ResponseBody>
+
+    @GET("audiobooks/{uuid}")
+    suspend fun getAudiobookInfo(
+        @Path("uuid") uuid: String,
+        @Header("auth-token") token: String,
+        @Header("app-user-agent") appUserAgent: String = BookmateApiFactory.APP_USER_AGENT
+    ): Response<ResponseBody>
+
+    @GET("audiobooks/{uuid}/playlists.json")
+    suspend fun getAudiobookPlaylist(
+        @Path("uuid") uuid: String,
+        @Header("auth-token") token: String,
+        @Header("app-user-agent") appUserAgent: String = BookmateApiFactory.APP_USER_AGENT
+    ): Response<ResponseBody>
+
+    @GET
+    suspend fun downloadByUrl(
+        @Url url: String,
         @Header("auth-token") token: String,
         @Header("app-user-agent") appUserAgent: String = BookmateApiFactory.APP_USER_AGENT
     ): Response<ResponseBody>

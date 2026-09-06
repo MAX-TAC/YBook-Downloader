@@ -15,16 +15,18 @@ data class DownloadHistoryItem(
     val title: String,
     val coverUrl: String? = null,
     val sourceUrl: String = "",
+    val resourceType: String = "BOOK",
     val format: String,
     val mime: String,
     val uri: String,
+    val uris: List<String> = emptyList(),
     val displayPath: String,
     val createdAt: Long = System.currentTimeMillis()
 )
 
 /**
  * Небольшое локальное хранилище истории скачиваний.
- * История хранится только внутри приложения и не затрагивает сами книги в Downloads.
+ * История хранится только внутри приложения и не затрагивает сами файлы в Downloads.
  */
 class HistoryStore(context: Context) {
     private val file = File(context.filesDir, "download_history.json")
@@ -45,7 +47,7 @@ class HistoryStore(context: Context) {
     fun add(item: DownloadHistoryItem): List<DownloadHistoryItem> {
         val updated = buildList {
             add(item)
-            addAll(load().filterNot { it.uri == item.uri })
+            addAll(load().filterNot { it.id == item.id })
         }.take(MAX_ITEMS)
         save(updated)
         return updated
