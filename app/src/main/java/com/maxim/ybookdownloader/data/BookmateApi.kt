@@ -8,6 +8,7 @@ import retrofit2.http.GET
 import retrofit2.http.Header
 import retrofit2.http.POST
 import retrofit2.http.Path
+import retrofit2.http.Query
 import retrofit2.http.Url
 
 interface BookmateApi {
@@ -37,6 +38,14 @@ interface BookmateApi {
         @Path("uuid") uuid: String,
         @Header("auth-token") token: String,
         @Header("app-user-agent") appUserAgent: String = BookmateApiFactory.APP_USER_AGENT
+    ): Response<ResponseBody>
+
+    @GET("profile/library_cards")
+    suspend fun getLibraryCards(
+        @Header("auth-token") token: String,
+        @Header("app-user-agent") appUserAgent: String = BookmateApiFactory.APP_USER_AGENT,
+        @Query("limit") limit: Int = 100,
+        @Query("offset") offset: Int = 0
     ): Response<ResponseBody>
 
     @GET

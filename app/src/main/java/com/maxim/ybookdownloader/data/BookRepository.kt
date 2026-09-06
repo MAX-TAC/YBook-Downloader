@@ -55,6 +55,17 @@ class BookRepository(private val context: Context) {
         val maxUrl: String?
     )
 
+    data class LibraryItem(
+        val id: String,
+        val type: ResourceType,
+        val title: String,
+        val coverUrl: String?,
+        val authors: List<String>,
+        val sourceUrl: String,
+        val workKey: String,
+        val state: String? = null
+    )
+
     private data class SearchCandidate(
         val type: ResourceType,
         val id: String,
@@ -265,6 +276,71 @@ class BookRepository(private val context: Context) {
             runCatching { ensureEmbeddedCover(file, coverUrl, token) }
         }
         return file
+    }
+
+    /**
+     * Загружает личную библиотеку авторизованного аккаунта. В Яндекс Книгах
+     * сохранённые/избранные произведения представлены карточками profile/library_cards.
+     * API может вернуть текстовую книгу, аудиокнигу или обе сущности.
+     */
+    suspend fun getMyLibrary(token: String): List<LibraryItem> {
+        val result = mutableListOf<LibraryItem>()
+        var offset = 0
+        val limit = 100
+
+        while (true) {
+            val response = api.getLibraryCards(token = token, limit = limit, offset = offset)
+            check(response.isSuccessful) { "Ошибка библиотеки: HTTP ${response.code()}" }
+            val body = response.body()?.string() ?: error("Пустой ответ библиотеки")
+            val root = Json.parseToJsonElement(body).jsonObject
+            val cards = (root["library_cards"] as? JsonArray).orEmpty()
+
+            cards.forEach { element ->
+                val card = element as? JsonObject ?: return@forEach
+                val state = card["state"]?.jsonPrimitive?.contentOrNull
+                parseLibraryResource(card["book"], ResourceType.BOOK, state)?.let(result::add)
+                parseLibraryResource(card["audiobook"], ResourceType.AUDIOBOOK, state)?.let(result::add)
+            }
+
+            if (cards.size < limit) break
+            offset += cards.size
+            if (cards.isEmpty()) break
+        }
+
+        return result.distinctBy { "${it.type}|${it.id}" }
+    }
+
+    private fun parseLibraryResource(
+        element: JsonElement?,
+        type: ResourceType,
+        state: String?
+    ): LibraryItem? {
+        val resource = element as? JsonObject ?: return null
+        val id = resource["uuid"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: return null
+        val title = sequenceOf(
+            resource["title"]?.jsonPrimitive?.contentOrNull,
+            resource["name"]?.jsonPrimitive?.contentOrNull
+        ).firstOrNull { !it.isNullOrBlank() }?.trim() ?: "Без названия"
+        val cover = (resource["cover"] as? JsonObject)?.let { coverObject ->
+            coverObject["large"]?.jsonPrimitive?.contentOrNull
+                ?: coverObject["url"]?.jsonPrimitive?.contentOrNull
+                ?: coverObject["small"]?.jsonPrimitive?.contentOrNull
+        }
+        val authors = extractAuthors(resource)
+        val sourceUrl = when (type) {
+            ResourceType.BOOK -> "https://books.yandex.ru/books/$id"
+            ResourceType.AUDIOBOOK -> "https://books.yandex.ru/audiobooks/$id"
+        }
+        return LibraryItem(
+            id = id,
+            type = type,
+            title = title,
+            coverUrl = cover,
+            authors = authors,
+            sourceUrl = sourceUrl,
+            workKey = makeWorkKey(title, authors),
+            state = state
+        )
     }
 
     suspend fun getAudiobookTracks(id: String, token: String): List<AudioTrack> {

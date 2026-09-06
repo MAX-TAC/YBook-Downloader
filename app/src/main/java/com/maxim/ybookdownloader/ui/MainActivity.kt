@@ -35,6 +35,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.Search
@@ -42,6 +44,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -156,6 +159,29 @@ enum class AudioQuality(val label: String, val isMax: Boolean) {
     MAX("M4A • Максимальное качество", true)
 }
 
+data class HistoryBookSummary(
+    val key: String,
+    val title: String,
+    val coverUrl: String?,
+    val authors: String,
+    val sourceUrl: String,
+    val fallbackBookId: String,
+    val fallbackType: ResourceType,
+    val textFormats: List<String>,
+    val audioChapters: List<Int>,
+    val totalAudioChapters: Int,
+    val audioFilesWithoutChapterInfo: Int,
+    val lastDownloadedAt: Long
+)
+
+data class FavoriteBookSummary(
+    val key: String,
+    val title: String,
+    val coverUrl: String?,
+    val authors: List<String>,
+    val reference: BookReference
+)
+
 private fun compactChapterList(numbers: List<Int>): String {
     val sorted = numbers.distinct().sorted()
     if (sorted.isEmpty()) return ""
@@ -188,6 +214,17 @@ class MainViewModel : ViewModel() {
 
     var history by mutableStateOf<List<DownloadHistoryItem>>(emptyList())
         private set
+
+    var favorites by mutableStateOf<List<BookRepository.LibraryItem>>(emptyList())
+        private set
+
+    var favoritesBusy by mutableStateOf(false)
+        private set
+
+    var favoritesError by mutableStateOf<String?>(null)
+        private set
+
+    private var favoritesLoaded = false
 
     fun init(context: Context) {
         if (!::repository.isInitialized) {
@@ -231,6 +268,7 @@ class MainViewModel : ViewModel() {
         }
 
         state = state.copy(
+            url = ref.sourceUrl,
             busy = true,
             error = null,
             message = null,
@@ -471,6 +509,100 @@ class MainViewModel : ViewModel() {
         }
     }
 
+    fun historyBooks(): List<HistoryBookSummary> {
+        if (history.isEmpty()) return emptyList()
+
+        return history
+            .groupBy { item ->
+                item.workKey.takeIf { it.isNotBlank() }
+                    ?: BookRepository.makeWorkKey(item.title, listOf(item.authors))
+            }
+            .map { (key, items) ->
+                val latest = items.maxByOrNull { it.createdAt } ?: items.first()
+                val textFormats = items
+                    .filter { it.resourceType != ResourceType.AUDIOBOOK.name }
+                    .map { it.format.substringBefore(" • ") }
+                    .distinct()
+                    .sorted()
+                val audioItems = items.filter { it.resourceType == ResourceType.AUDIOBOOK.name }
+                val audioChapters = audioItems.flatMap { it.chapterNumbers }.distinct().sorted()
+                val totalAudio = audioItems.maxOfOrNull { it.totalChapters } ?: 0
+                val legacyAudioFiles = audioItems
+                    .filter { it.chapterNumbers.isEmpty() }
+                    .sumOf { if (it.uris.isNotEmpty()) it.uris.size else 1 }
+
+                val fallbackType = runCatching { ResourceType.valueOf(latest.resourceType) }
+                    .getOrDefault(ResourceType.BOOK)
+                HistoryBookSummary(
+                    key = key,
+                    title = latest.title,
+                    coverUrl = latest.coverUrl,
+                    authors = latest.authors,
+                    sourceUrl = latest.sourceUrl,
+                    fallbackBookId = latest.bookId,
+                    fallbackType = fallbackType,
+                    textFormats = textFormats,
+                    audioChapters = audioChapters,
+                    totalAudioChapters = totalAudio,
+                    audioFilesWithoutChapterInfo = legacyAudioFiles,
+                    lastDownloadedAt = items.maxOf { it.createdAt }
+                )
+            }
+            .sortedByDescending { it.lastDownloadedAt }
+    }
+
+    fun openHistoryBook(summary: HistoryBookSummary) {
+        val parsed = summary.sourceUrl.takeIf { it.isNotBlank() }?.let(BookUrlParser::parse)
+        val reference = parsed ?: BookReference(
+            id = summary.fallbackBookId,
+            sourceUrl = summary.sourceUrl,
+            type = summary.fallbackType
+        )
+        loadBook(reference)
+    }
+
+    fun loadFavorites(force: Boolean = false) {
+        if (favoritesBusy || (favoritesLoaded && !force)) return
+        val token = tokenStore.getToken() ?: run {
+            favoritesError = "Сессия Яндекса не найдена. Войдите заново."
+            return
+        }
+        favoritesBusy = true
+        favoritesError = null
+        viewModelScope.launch {
+            runCatching { withContext(Dispatchers.IO) { repository.getMyLibrary(token) } }
+                .onSuccess { items ->
+                    favorites = items
+                    favoritesLoaded = true
+                    favoritesBusy = false
+                }
+                .onFailure {
+                    favoritesBusy = false
+                    favoritesError = it.message ?: "Не удалось загрузить избранное"
+                }
+        }
+    }
+
+    fun favoriteWorks(): List<FavoriteBookSummary> {
+        return favorites
+            .groupBy { it.workKey.ifBlank { BookRepository.makeWorkKey(it.title, it.authors) } }
+            .map { (key, items) ->
+                val primary = items.firstOrNull { it.type == ResourceType.BOOK } ?: items.first()
+                FavoriteBookSummary(
+                    key = key,
+                    title = primary.title,
+                    coverUrl = primary.coverUrl ?: items.firstNotNullOfOrNull { it.coverUrl },
+                    authors = primary.authors.ifEmpty { items.flatMap { it.authors }.distinct() },
+                    reference = BookReference(primary.id, primary.sourceUrl, primary.type)
+                )
+            }
+            .sortedBy { it.title.lowercase(Locale.getDefault()) }
+    }
+
+    fun openFavorite(item: FavoriteBookSummary) {
+        loadBook(item.reference)
+    }
+
     /**
      * В v0.5.0 «Поделиться» принципиально НЕ скачивает ничего заново.
      * Возвращаем только уже сохранённые пользователем форматы текущего произведения.
@@ -574,6 +706,9 @@ class MainViewModel : ViewModel() {
         epubFile = null
         textInfo = null
         audioInfo = null
+        favorites = emptyList()
+        favoritesLoaded = false
+        favoritesError = null
         state = BookUiState()
     }
 
@@ -607,7 +742,7 @@ class MainViewModel : ViewModel() {
     }
 }
 
-private enum class AppSection { HOME, HISTORY }
+private enum class AppSection { HOME, FAVORITES, HISTORY }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -684,6 +819,12 @@ fun YBookApp(
         }
     }
 
+    LaunchedEffect(selectedSection, authenticated) {
+        if (authenticated && selectedSection == AppSection.FAVORITES) {
+            vm.loadFavorites()
+        }
+    }
+
     LaunchedEffect(state.error, state.message) {
         val text = state.error ?: state.message
         if (!text.isNullOrBlank()) {
@@ -728,6 +869,12 @@ fun YBookApp(
                     label = { Text("Главная") }
                 )
                 NavigationBarItem(
+                    selected = selectedSection == AppSection.FAVORITES,
+                    onClick = { selectedSection = AppSection.FAVORITES },
+                    icon = { Icon(Icons.Default.Favorite, contentDescription = null) },
+                    label = { Text("Избранное") }
+                )
+                NavigationBarItem(
                     selected = selectedSection == AppSection.HISTORY,
                     onClick = { selectedSection = AppSection.HISTORY },
                     icon = { Icon(Icons.Default.History, contentDescription = null) },
@@ -751,10 +898,25 @@ fun YBookApp(
                 onShare = { showShareDialog = true }
             )
 
+            AppSection.FAVORITES -> FavoritesScreen(
+                modifier = Modifier.padding(padding),
+                favoriteItems = vm.favoriteWorks(),
+                busy = vm.favoritesBusy,
+                error = vm.favoritesError,
+                onRefresh = { vm.loadFavorites(force = true) },
+                onOpen = { item ->
+                    selectedSection = AppSection.HOME
+                    vm.openFavorite(item)
+                }
+            )
+
             AppSection.HISTORY -> HistoryScreen(
                 modifier = Modifier.padding(padding),
-                items = vm.history,
-                onShare = { vm.shareHistoryItem(context, it) },
+                items = vm.historyBooks(),
+                onOpen = { item ->
+                    selectedSection = AppSection.HOME
+                    vm.openHistoryBook(item)
+                },
                 onClear = { vm.clearHistory() }
             )
         }
@@ -1027,8 +1189,8 @@ private fun HomeScreen(
 @Composable
 private fun HistoryScreen(
     modifier: Modifier,
-    items: List<DownloadHistoryItem>,
-    onShare: (DownloadHistoryItem) -> Unit,
+    items: List<HistoryBookSummary>,
+    onOpen: (HistoryBookSummary) -> Unit,
     onClear: () -> Unit
 ) {
     Column(
@@ -1043,64 +1205,192 @@ private fun HistoryScreen(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("История скачиваний", style = MaterialTheme.typography.headlineSmall)
+            Text("История", style = MaterialTheme.typography.headlineSmall)
             if (items.isNotEmpty()) TextButton(onClick = onClear) { Text("Очистить") }
         }
 
         if (items.isEmpty()) {
             Card(Modifier.fillMaxWidth()) {
                 Text(
-                    "Здесь появятся книги и аудиокниги, которые вы сохранили на устройство.",
+                    "Здесь появятся произведения, которые вы сохраняли на устройство.",
                     modifier = Modifier.padding(20.dp)
                 )
             }
         } else {
-            items.forEach { item -> HistoryCard(item, onShare = { onShare(item) }) }
+            items.forEach { item ->
+                HistoryBookCard(item = item, onClick = { onOpen(item) })
+            }
         }
     }
 }
 
 @Composable
-private fun HistoryCard(item: DownloadHistoryItem, onShare: () -> Unit) {
-    val date = remember(item.createdAt) {
-        SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date(item.createdAt))
+private fun HistoryBookCard(item: HistoryBookSummary, onClick: () -> Unit) {
+    val date = remember(item.lastDownloadedAt) {
+        SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date(item.lastDownloadedAt))
+    }
+    val audioText = when {
+        item.audioChapters.isNotEmpty() && item.totalAudioChapters > 0 &&
+            item.audioChapters.size >= item.totalAudioChapters -> "Аудио: все ${item.totalAudioChapters} глав"
+        item.audioChapters.isNotEmpty() -> "Аудио: главы ${compactChapterList(item.audioChapters)}"
+        item.audioFilesWithoutChapterInfo > 0 -> "Аудио: ${item.audioFilesWithoutChapterInfo} файлов"
+        else -> null
     }
 
-    Card(Modifier.fillMaxWidth()) {
+    Card(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth()
+    ) {
         Row(
             modifier = Modifier.padding(14.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             item.coverUrl?.let {
-                AsyncImage(model = it, contentDescription = "Обложка", modifier = Modifier.size(72.dp))
+                AsyncImage(model = it, contentDescription = "Обложка", modifier = Modifier.size(76.dp))
             }
             Column(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 Text(item.title, style = MaterialTheme.typography.titleMedium)
-                Text(
-                    "${item.format} • $date",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                if (item.resourceType == ResourceType.AUDIOBOOK.name && item.chapterNumbers.isNotEmpty()) {
+                if (item.authors.isNotBlank()) {
                     Text(
-                        "Главы: ${compactChapterList(item.chapterNumbers)}",
+                        item.authors,
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1
                     )
                 }
+                if (item.textFormats.isNotEmpty()) {
+                    Text(
+                        "Текст: ${item.textFormats.joinToString(", ")}",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                audioText?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall)
+                }
                 Text(
-                    item.displayPath,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 2
+                    "Последнее скачивание: $date",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
-            IconButton(onClick = onShare) {
-                Icon(Icons.Default.Share, contentDescription = "Поделиться")
+        }
+    }
+}
+
+@Composable
+private fun FavoritesScreen(
+    modifier: Modifier,
+    favoriteItems: List<FavoriteBookSummary>,
+    busy: Boolean,
+    error: String?,
+    onRefresh: () -> Unit,
+    onOpen: (FavoriteBookSummary) -> Unit
+) {
+    var query by remember { mutableStateOf("") }
+    val normalizedQuery = remember(query) { BookRepository.normalize(query) }
+    val filtered = remember(favoriteItems, normalizedQuery) {
+        if (normalizedQuery.isBlank()) favoriteItems
+        else favoriteItems.filter { item ->
+            BookRepository.normalize(item.title).contains(normalizedQuery) ||
+                item.authors.any { BookRepository.normalize(it).contains(normalizedQuery) }
+        }
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Избранное", style = MaterialTheme.typography.headlineSmall)
+            IconButton(onClick = onRefresh, enabled = !busy) {
+                Icon(Icons.Default.Refresh, contentDescription = "Обновить")
+            }
+        }
+
+        OutlinedTextField(
+            value = query,
+            onValueChange = { query = it },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("Поиск по названию или автору") },
+            leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+            trailingIcon = {
+                if (query.isNotEmpty()) {
+                    IconButton(onClick = { query = "" }) {
+                        Icon(Icons.Default.Clear, contentDescription = "Очистить поиск")
+                    }
+                }
+            }
+        )
+
+        if (busy) {
+            LinearProgressIndicator(Modifier.fillMaxWidth())
+        }
+
+        error?.let {
+            Card(Modifier.fillMaxWidth()) {
+                Text(
+                    it,
+                    modifier = Modifier.padding(16.dp),
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+        }
+
+        if (!busy && error == null && favoriteItems.isEmpty()) {
+            Card(Modifier.fillMaxWidth()) {
+                Text(
+                    "В библиотеке Яндекс Книг пока нет сохранённых произведений.",
+                    modifier = Modifier.padding(20.dp)
+                )
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                items(filtered, key = { it.key }) { item ->
+                    FavoriteBookCard(item = item, onClick = { onOpen(item) })
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FavoriteBookCard(item: FavoriteBookSummary, onClick: () -> Unit) {
+    Card(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            item.coverUrl?.let {
+                AsyncImage(model = it, contentDescription = "Обложка", modifier = Modifier.size(70.dp))
+            }
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(3.dp)
+            ) {
+                Text(item.title, style = MaterialTheme.typography.titleMedium)
+                if (item.authors.isNotEmpty()) {
+                    Text(
+                        item.authors.joinToString(", "),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2
+                    )
+                }
             }
         }
     }
@@ -1364,29 +1654,23 @@ private fun SettingsDialog(
                 }
 
                 HorizontalDivider(Modifier.padding(vertical = 6.dp))
-                OutlinedButton(
+                Button(
                     onClick = onLogout,
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer,
+                        contentColor = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 ) {
-                    Text("Сбросить авторизацию Яндекс Книг")
+                    Text("Отключить аккаунт Яндекс Книг")
                 }
 
                 HorizontalDivider(Modifier.padding(vertical = 8.dp))
                 Column(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    Image(
-                        painter = painterResource(R.drawable.ic_launcher_art),
-                        contentDescription = "Иконка YBook Downloader",
-                        modifier = Modifier.size(56.dp)
-                    )
-                    Text(
-                        "YBook Downloader",
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.Medium
-                    )
                     Text(
                         "Версия $versionName",
                         style = MaterialTheme.typography.bodySmall,
@@ -1402,13 +1686,7 @@ private fun SettingsDialog(
                             )
                         }
                     ) {
-                        Icon(
-                            painter = painterResource(R.drawable.ic_github),
-                            contentDescription = "GitHub",
-                            modifier = Modifier.size(22.dp)
-                        )
-                        Spacer(Modifier.size(8.dp))
-                        Text("GitHub")
+                        Text("GitHub: MAX-TAC/YBook-Downloader")
                     }
                 }
             }
