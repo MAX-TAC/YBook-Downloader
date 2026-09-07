@@ -43,7 +43,6 @@ import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Link
-import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.Search
@@ -74,6 +73,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -116,20 +116,27 @@ import java.util.Locale
 class MainActivity : ComponentActivity() {
     private val sharedText = mutableStateOf<String?>(null)
     private val themeMode = mutableStateOf(ThemeMode.SYSTEM)
+    private val startTab = mutableStateOf(StartTab.HOME)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         sharedText.value = extractSharedText(intent)
         val themeStore = ThemeStore(applicationContext)
         themeMode.value = themeStore.get()
+        startTab.value = themeStore.getStartTab()
         setContent {
             YBookTheme(themeMode.value) {
                 YBookApp(
                     initialText = sharedText.value,
                     themeMode = themeMode.value,
+                    startTab = startTab.value,
                     onThemeModeChange = { mode ->
                         themeStore.set(mode)
                         themeMode.value = mode
+                    },
+                    onStartTabChange = { tab ->
+                        themeStore.setStartTab(tab)
+                        startTab.value = tab
                     }
                 )
             }
@@ -230,6 +237,9 @@ class MainViewModel : ViewModel() {
         private set
 
     var favoritesBusy by mutableStateOf(false)
+        private set
+
+    var favoritesRefreshing by mutableStateOf(false)
         private set
 
     var favoritesError by mutableStateOf<String?>(null)
@@ -783,36 +793,45 @@ class MainViewModel : ViewModel() {
     fun loadFavorites(force: Boolean = false) {
         if (favoritesBusy) return
         if (force) {
-            favorites = emptyList()
-            favoritesOffset = 0
-            favoritesHasMore = true
-            favoritesLoaded = false
-        } else if (favoritesLoaded) {
-            return
+            loadFavoritesPage(replace = true)
+        } else if (!favoritesLoaded) {
+            loadFavoritesPage(replace = true)
         }
-        loadMoreFavorites()
     }
 
     fun loadMoreFavorites() {
         if (favoritesBusy || !favoritesHasMore) return
+        loadFavoritesPage(replace = false)
+    }
+
+    private fun loadFavoritesPage(replace: Boolean) {
+        if (favoritesBusy) return
+        if (!replace && !favoritesHasMore) return
         val token = tokenStore.getToken() ?: run {
             favoritesError = "Сессия Яндекса не найдена. Войдите заново."
             return
         }
         favoritesBusy = true
+        favoritesRefreshing = replace && favoritesLoaded
         favoritesError = null
-        val offset = favoritesOffset
+        val offset = if (replace) 0 else favoritesOffset
         viewModelScope.launch {
             runCatching { withContext(Dispatchers.IO) { repository.getMyLibraryPage(token, limit = 20, offset = offset) } }
                 .onSuccess { page ->
-                    favorites = (favorites + page.items).distinctBy { "${it.type}|${it.id}" }
-                    favoritesOffset += page.cardCount
+                    favorites = if (replace) {
+                        page.items.distinctBy { "${it.type}|${it.id}" }
+                    } else {
+                        (favorites + page.items).distinctBy { "${it.type}|${it.id}" }
+                    }
+                    favoritesOffset = if (replace) page.cardCount else favoritesOffset + page.cardCount
                     favoritesHasMore = page.hasMore && page.cardCount > 0
                     favoritesLoaded = true
                     favoritesBusy = false
+                    favoritesRefreshing = false
                 }
                 .onFailure {
                     favoritesBusy = false
+                    favoritesRefreshing = false
                     favoritesError = it.message ?: "Не удалось загрузить избранное"
                 }
         }
@@ -975,6 +994,7 @@ class MainViewModel : ViewModel() {
         favoritesLoaded = false
         favoritesOffset = 0
         favoritesHasMore = true
+        favoritesRefreshing = false
         favoritesError = null
         catalogResults = emptyList()
         catalogQuery = ""
@@ -1020,19 +1040,28 @@ class MainViewModel : ViewModel() {
 
 private enum class AppSection { HOME, SEARCH, FAVORITES, HISTORY }
 
+private fun StartTab.toAppSection(): AppSection = when (this) {
+    StartTab.HOME -> AppSection.HOME
+    StartTab.SEARCH -> AppSection.SEARCH
+    StartTab.FAVORITES -> AppSection.FAVORITES
+    StartTab.HISTORY -> AppSection.HISTORY
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun YBookApp(
     initialText: String?,
     themeMode: ThemeMode,
+    startTab: StartTab,
     onThemeModeChange: (ThemeMode) -> Unit,
+    onStartTabChange: (StartTab) -> Unit,
     vm: MainViewModel = viewModel()
 ) {
     val context = LocalContext.current
     vm.init(context)
 
     var authenticated by remember { mutableStateOf(vm.hasToken()) }
-    var selectedSection by remember { mutableStateOf(AppSection.HOME) }
+    var selectedSection by remember { mutableStateOf(startTab.toAppSection()) }
     var selectedHomeSectionTitle by remember { mutableStateOf<String?>(null) }
     var bookReturnSection by remember { mutableStateOf(AppSection.SEARCH) }
     var bookReturnHomeSectionTitle by remember { mutableStateOf<String?>(null) }
@@ -1056,7 +1085,6 @@ fun YBookApp(
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && vm.hasToken()) {
             authenticated = true
-            vm.loadHome(force = true)
         }
     }
 
@@ -1175,22 +1203,6 @@ fun YBookApp(
                     }
                 },
                 actions = {
-                    if (selectedSection == AppSection.HOME && selectedHomeSectionTitle == null) {
-                        IconButton(
-                            onClick = { vm.loadHome(force = true) },
-                            enabled = !vm.homeBusy
-                        ) {
-                            Icon(Icons.Default.Refresh, contentDescription = "Обновить главную")
-                        }
-                    }
-                    if (selectedSection == AppSection.FAVORITES) {
-                        IconButton(
-                            onClick = { vm.loadFavorites(force = true) },
-                            enabled = !vm.favoritesBusy
-                        ) {
-                            Icon(Icons.Default.Refresh, contentDescription = "Обновить избранное")
-                        }
-                    }
                     if (selectedSection == AppSection.HISTORY && vm.history.isNotEmpty()) {
                         IconButton(onClick = { vm.clearHistory() }) {
                             Icon(Icons.Default.DeleteOutline, contentDescription = "Очистить историю")
@@ -1302,8 +1314,10 @@ fun YBookApp(
                 modifier = Modifier.padding(padding),
                 favoriteItems = vm.favoriteWorks(),
                 busy = vm.favoritesBusy,
+                refreshing = vm.favoritesRefreshing,
                 error = vm.favoritesError,
                 hasMore = vm.favoritesHasMore,
+                onRefresh = { vm.loadFavorites(force = true) },
                 onLoadMore = vm::loadMoreFavorites,
                 onRemove = vm::removeFavorite,
                 onOpen = { item ->
@@ -1399,7 +1413,9 @@ fun YBookApp(
     if (showSettings) {
         SettingsDialog(
             themeMode = themeMode,
+            startTab = startTab,
             onThemeModeChange = onThemeModeChange,
+            onStartTabChange = onStartTabChange,
             onLogout = {
                 showSettings = false
                 vm.logout()
@@ -1421,6 +1437,7 @@ fun YBookApp(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun DiscoveryHomeScreen(
     modifier: Modifier,
@@ -1433,57 +1450,61 @@ private fun DiscoveryHomeScreen(
     onOpenSection: (BookRepository.HomeSection) -> Unit,
     onPopularSearch: (String) -> Unit
 ) {
-    LazyColumn(
-        modifier = modifier.fillMaxSize(),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(18.dp)
+    PullToRefreshBox(
+        isRefreshing = busy,
+        onRefresh = onRefresh,
+        modifier = modifier.fillMaxSize()
     ) {
-        if (busy) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
-
-        if (popularSearches.isNotEmpty()) {
-            item { Text("Популярные запросы", style = MaterialTheme.typography.titleLarge) }
-            item {
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(popularSearches) { query ->
-                        OutlinedButton(onClick = { onPopularSearch(query) }) { Text(query) }
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(18.dp)
+        ) {
+            if (popularSearches.isNotEmpty()) {
+                item { Text("Популярные запросы", style = MaterialTheme.typography.titleLarge) }
+                item {
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(popularSearches) { query ->
+                            OutlinedButton(onClick = { onPopularSearch(query) }) { Text(query) }
+                        }
                     }
                 }
             }
-        }
 
-        sections.forEach { section ->
-            item(key = "title-${section.title}") {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(section.title, style = MaterialTheme.typography.titleLarge)
-                    TextButton(onClick = { onOpenSection(section) }) { Text("Все") }
-                }
-            }
-            item(key = "row-${section.title}") {
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    items(section.items.take(10), key = { "${it.type}-${it.id}" }) { book ->
-                        HomeBookCard(book = book, onClick = { onBook(book) })
-                    }
-                }
-            }
-        }
-
-        if (!busy && sections.isEmpty() && popularSearches.isEmpty()) {
-            item {
-                Card(Modifier.fillMaxWidth()) {
-                    Column(
-                        Modifier.padding(18.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+            sections.forEach { section ->
+                item(key = "title-${section.title}") {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Подборки пока недоступны", style = MaterialTheme.typography.titleMedium)
-                        Text(
-                            error ?: "Яндекс изменил структуру главной страницы. Поиск, избранное и история продолжат работать.",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        TextButton(onClick = onRefresh) { Text("Повторить") }
+                        Text(section.title, style = MaterialTheme.typography.titleLarge)
+                        TextButton(onClick = { onOpenSection(section) }) { Text("Все") }
+                    }
+                }
+                item(key = "row-${section.title}") {
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        items(section.items.take(10), key = { "${it.type}-${it.id}" }) { book ->
+                            HomeBookCard(book = book, onClick = { onBook(book) })
+                        }
+                    }
+                }
+            }
+
+            if (!busy && sections.isEmpty() && popularSearches.isEmpty()) {
+                item {
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(
+                            Modifier.padding(18.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text("Подборки пока недоступны", style = MaterialTheme.typography.titleMedium)
+                            Text(
+                                error ?: "Яндекс изменил структуру главной страницы. Поиск, избранное и история продолжат работать.",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            TextButton(onClick = onRefresh) { Text("Повторить") }
+                        }
                     }
                 }
             }
@@ -1804,7 +1825,7 @@ private fun BookDetailScreen(
                 ) {
                     Spacer(Modifier.height(18.dp))
                     Box(
-                        modifier = Modifier.size(190.dp),
+                        modifier = Modifier.width(190.dp).height(270.dp),
                         contentAlignment = Alignment.Center
                     ) {
                         state.coverUrl?.let { cover ->
@@ -1812,7 +1833,7 @@ private fun BookDetailScreen(
                                 model = cover,
                                 contentDescription = "Обложка",
                                 modifier = Modifier.fillMaxSize(),
-                                contentScale = ContentScale.Crop
+                                contentScale = ContentScale.Fit
                             )
                         } ?: Icon(
                             Icons.Default.MenuBook,
@@ -2016,13 +2037,16 @@ private fun HistoryBookCard(item: HistoryBookSummary, onClick: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun FavoritesScreen(
     modifier: Modifier,
     favoriteItems: List<FavoriteBookSummary>,
     busy: Boolean,
+    refreshing: Boolean,
     error: String?,
     hasMore: Boolean,
+    onRefresh: () -> Unit,
     onLoadMore: () -> Unit,
     onRemove: (FavoriteBookSummary) -> Unit,
     onOpen: (FavoriteBookSummary) -> Unit
@@ -2037,66 +2061,75 @@ private fun FavoritesScreen(
         }
     }
 
-    Column(
-        modifier = modifier.fillMaxSize().padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+    PullToRefreshBox(
+        isRefreshing = refreshing,
+        onRefresh = onRefresh,
+        modifier = modifier.fillMaxSize()
     ) {
-        OutlinedTextField(
-            value = query,
-            onValueChange = { query = it },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-            label = { Text("Поиск в избранном") },
-            leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
-            trailingIcon = {
-                if (query.isNotEmpty()) {
-                    IconButton(onClick = { query = "" }) {
-                        Icon(Icons.Default.Clear, contentDescription = "Очистить поиск")
+        Column(
+            modifier = Modifier.fillMaxSize().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                label = { Text("Поиск в избранном") },
+                leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+                trailingIcon = {
+                    if (query.isNotEmpty()) {
+                        IconButton(onClick = { query = "" }) {
+                            Icon(Icons.Default.Clear, contentDescription = "Очистить поиск")
+                        }
                     }
                 }
-            }
-        )
+            )
 
-        if (busy && favoriteItems.isEmpty()) LinearProgressIndicator(Modifier.fillMaxWidth())
-
-        error?.let {
-            Card(Modifier.fillMaxWidth()) {
-                Text(it, modifier = Modifier.padding(16.dp), color = MaterialTheme.colorScheme.error)
+            // Начальная загрузка показывает одну полоску. При pull-to-refresh используется
+            // только штатный индикатор жеста сверху, чтобы не было двойной индикации.
+            if (busy && !refreshing && favoriteItems.isEmpty()) {
+                LinearProgressIndicator(Modifier.fillMaxWidth())
             }
-        }
 
-        if (!busy && error == null && favoriteItems.isEmpty()) {
-            Card(Modifier.fillMaxWidth()) {
-                Text(
-                    "В библиотеке Яндекс Книг пока нет сохранённых произведений.",
-                    modifier = Modifier.padding(20.dp)
-                )
+            error?.let {
+                Card(Modifier.fillMaxWidth()) {
+                    Text(it, modifier = Modifier.padding(16.dp), color = MaterialTheme.colorScheme.error)
+                }
             }
-        } else {
-            LazyColumn(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                items(filtered, key = { it.key }) { item ->
-                    FavoriteBookCard(
-                        item = item,
-                        onClick = { onOpen(item) },
-                        onRemove = { onRemove(item) }
+
+            if (!busy && error == null && favoriteItems.isEmpty()) {
+                Card(Modifier.fillMaxWidth()) {
+                    Text(
+                        "В библиотеке Яндекс Книг пока нет сохранённых произведений.",
+                        modifier = Modifier.padding(20.dp)
                     )
                 }
-                if (hasMore || (busy && favoriteItems.isNotEmpty())) {
-                    item(key = "favorites-more-${favoriteItems.size}") {
-                        LaunchedEffect(favoriteItems.size, hasMore, busy, query) {
-                            if (hasMore && !busy) onLoadMore()
+            } else {
+                LazyColumn(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    items(filtered, key = { it.key }) { item ->
+                        FavoriteBookCard(
+                            item = item,
+                            onClick = { onOpen(item) },
+                            onRemove = { onRemove(item) }
+                        )
+                    }
+                    if (hasMore || (busy && !refreshing && favoriteItems.isNotEmpty())) {
+                        item(key = "favorites-more-${favoriteItems.size}") {
+                            LaunchedEffect(favoriteItems.size, hasMore, busy, refreshing, query) {
+                                if (hasMore && !busy && !refreshing) onLoadMore()
+                            }
+                            if (busy && !refreshing) LinearProgressIndicator(Modifier.fillMaxWidth())
+                            else Spacer(Modifier.height(8.dp))
                         }
-                        if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-                        else Spacer(Modifier.height(8.dp))
                     }
                 }
             }
         }
     }
-
 }
 
 @Composable
@@ -2351,7 +2384,9 @@ private fun AudioChapterDialog(
 @Composable
 private fun SettingsDialog(
     themeMode: ThemeMode,
+    startTab: StartTab,
     onThemeModeChange: (ThemeMode) -> Unit,
+    onStartTabChange: (StartTab) -> Unit,
     onLogout: () -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -2389,6 +2424,34 @@ private fun SettingsDialog(
                         ) {
                             Text(
                                 mode.label,
+                                modifier = Modifier.fillMaxWidth(),
+                                textAlign = TextAlign.Start
+                            )
+                        }
+                    }
+                }
+
+                HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                Text(
+                    "Вкладка при открытии приложения",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Medium
+                )
+                StartTab.entries.forEach { tab ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = startTab == tab,
+                            onClick = { onStartTabChange(tab) }
+                        )
+                        TextButton(
+                            onClick = { onStartTabChange(tab) },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(
+                                tab.label,
                                 modifier = Modifier.fillMaxWidth(),
                                 textAlign = TextAlign.Start
                             )
