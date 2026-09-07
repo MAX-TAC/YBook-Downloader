@@ -85,7 +85,9 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.layout.ContentScale
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -600,7 +602,7 @@ class MainViewModel : ViewModel() {
         homeBusy = true
         homeError = null
         viewModelScope.launch {
-            val sectionsResult = runCatching { withContext(Dispatchers.IO) { repository.getHomeSections() } }
+            val sectionsResult = runCatching { withContext(Dispatchers.IO) { repository.getHomeSections(token) } }
             val popularResult = runCatching { withContext(Dispatchers.IO) { repository.getPopularSearches(token) } }
             homeSections = sectionsResult.getOrDefault(emptyList())
             popularSearches = popularResult.getOrDefault(emptyList())
@@ -936,6 +938,7 @@ fun YBookApp(
 
     var authenticated by remember { mutableStateOf(vm.hasToken()) }
     var selectedSection by remember { mutableStateOf(AppSection.HOME) }
+    var selectedHomeSection by remember { mutableStateOf<BookRepository.HomeSection?>(null) }
     var showLinkDialog by remember { mutableStateOf(false) }
     var showFormats by remember { mutableStateOf(false) }
     var showAudioQuality by remember { mutableStateOf(false) }
@@ -1036,7 +1039,10 @@ fun YBookApp(
             NavigationBar {
                 NavigationBarItem(
                     selected = selectedSection == AppSection.HOME,
-                    onClick = { selectedSection = AppSection.HOME },
+                    onClick = {
+                        selectedSection = AppSection.HOME
+                        selectedHomeSection = null
+                    },
                     icon = { Icon(Icons.Default.Home, contentDescription = null) },
                     label = { Text("Главная") }
                 )
@@ -1063,26 +1069,39 @@ fun YBookApp(
         snackbarHost = { SnackbarHost(snackbarHostState) }
     ) { padding ->
         when (selectedSection) {
-            AppSection.HOME -> DiscoveryHomeScreen(
-                modifier = Modifier.padding(padding),
-                sections = vm.homeSections,
-                popularSearches = vm.popularSearches,
-                recent = vm.historyBooks().take(8),
-                busy = vm.homeBusy,
-                error = vm.homeError,
-                onRefresh = { vm.loadHome(force = true) },
-                onBook = ::openCatalogItem,
-                onPopularSearch = { query ->
-                    catalogInput = query
-                    vm.clearCurrentBook()
-                    vm.searchCatalog(query)
-                    selectedSection = AppSection.SEARCH
-                },
-                onRecent = { item ->
-                    selectedSection = AppSection.SEARCH
-                    vm.openHistoryBook(item)
+            AppSection.HOME -> {
+                val openedSection = selectedHomeSection
+                if (openedSection != null) {
+                    HomeSectionScreen(
+                        modifier = Modifier.padding(padding),
+                        section = openedSection,
+                        onBack = { selectedHomeSection = null },
+                        onBook = ::openCatalogItem
+                    )
+                } else {
+                    DiscoveryHomeScreen(
+                        modifier = Modifier.padding(padding),
+                        sections = vm.homeSections,
+                        popularSearches = vm.popularSearches,
+                        recent = vm.historyBooks().take(8),
+                        busy = vm.homeBusy,
+                        error = vm.homeError,
+                        onRefresh = { vm.loadHome(force = true) },
+                        onBook = ::openCatalogItem,
+                        onOpenSection = { selectedHomeSection = it },
+                        onPopularSearch = { query ->
+                            catalogInput = query
+                            vm.clearCurrentBook()
+                            vm.searchCatalog(query)
+                            selectedSection = AppSection.SEARCH
+                        },
+                        onRecent = { item ->
+                            selectedSection = AppSection.SEARCH
+                            vm.openHistoryBook(item)
+                        }
+                    )
                 }
-            )
+            }
 
             AppSection.SEARCH -> CatalogSearchScreen(
                 modifier = Modifier.padding(padding),
@@ -1240,6 +1259,7 @@ private fun DiscoveryHomeScreen(
     error: String?,
     onRefresh: () -> Unit,
     onBook: (BookRepository.CatalogItem) -> Unit,
+    onOpenSection: (BookRepository.HomeSection) -> Unit,
     onPopularSearch: (String) -> Unit,
     onRecent: (HistoryBookSummary) -> Unit
 ) {
@@ -1283,11 +1303,18 @@ private fun DiscoveryHomeScreen(
 
         sections.forEach { section ->
             item(key = "title-${section.title}") {
-                Text(section.title, style = MaterialTheme.typography.titleLarge)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(section.title, style = MaterialTheme.typography.titleLarge)
+                    TextButton(onClick = { onOpenSection(section) }) { Text("Все") }
+                }
             }
             item(key = "row-${section.title}") {
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    items(section.items, key = { "${it.type}-${it.id}" }) { book ->
+                    items(section.items.take(10), key = { "${it.type}-${it.id}" }) { book ->
                         HomeBookCard(book = book, onClick = { onBook(book) })
                     }
                 }
@@ -1327,47 +1354,157 @@ private fun DiscoveryHomeScreen(
 
 @Composable
 private fun HomeBookCard(book: BookRepository.CatalogItem, onClick: () -> Unit) {
-    Card(onClick = onClick, modifier = Modifier.width(132.dp)) {
-        Column {
-            if (!book.coverUrl.isNullOrBlank()) {
-                AsyncImage(
-                    model = book.coverUrl,
-                    contentDescription = book.title,
-                    modifier = Modifier.fillMaxWidth().height(184.dp)
-                )
-            } else {
-                Box(
-                    modifier = Modifier.fillMaxWidth().height(184.dp),
-                    contentAlignment = Alignment.Center
-                ) { Icon(Icons.Default.MenuBook, contentDescription = null, modifier = Modifier.size(44.dp)) }
-            }
-            Text(
-                book.title,
-                modifier = Modifier.padding(9.dp),
-                style = MaterialTheme.typography.bodyMedium,
-                maxLines = 3
+    Card(
+        onClick = onClick,
+        modifier = Modifier.width(148.dp).height(300.dp)
+    ) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            HomeCover(
+                coverUrl = book.coverUrl,
+                title = book.title,
+                modifier = Modifier.fillMaxWidth().height(194.dp)
             )
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 9.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Text(
+                    book.title,
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (book.authors.isNotEmpty()) {
+                    Text(
+                        book.authors.joinToString(", "),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
         }
     }
 }
 
 @Composable
 private fun RecentBookCard(book: HistoryBookSummary, onClick: () -> Unit) {
-    Card(onClick = onClick, modifier = Modifier.width(132.dp)) {
-        Column {
-            if (!book.coverUrl.isNullOrBlank()) {
-                AsyncImage(
-                    model = book.coverUrl,
-                    contentDescription = book.title,
-                    modifier = Modifier.fillMaxWidth().height(184.dp)
+    Card(
+        onClick = onClick,
+        modifier = Modifier.width(148.dp).height(300.dp)
+    ) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            HomeCover(
+                coverUrl = book.coverUrl,
+                title = book.title,
+                modifier = Modifier.fillMaxWidth().height(194.dp)
+            )
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 9.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Text(
+                    book.title,
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
                 )
-            } else {
-                Box(
-                    modifier = Modifier.fillMaxWidth().height(184.dp),
-                    contentAlignment = Alignment.Center
-                ) { Icon(Icons.Default.MenuBook, contentDescription = null, modifier = Modifier.size(44.dp)) }
+                if (book.authors.isNotBlank()) {
+                    Text(
+                        book.authors,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
             }
-            Text(book.title, modifier = Modifier.padding(9.dp), style = MaterialTheme.typography.bodyMedium, maxLines = 3)
+        }
+    }
+}
+
+@Composable
+private fun HomeCover(
+    coverUrl: String?,
+    title: String,
+    modifier: Modifier = Modifier
+) {
+    if (!coverUrl.isNullOrBlank()) {
+        AsyncImage(
+            model = coverUrl,
+            contentDescription = title,
+            modifier = modifier,
+            contentScale = ContentScale.Crop
+        )
+    } else {
+        Box(modifier = modifier, contentAlignment = Alignment.Center) {
+            Icon(Icons.Default.MenuBook, contentDescription = null, modifier = Modifier.size(44.dp))
+        }
+    }
+}
+
+@Composable
+private fun HomeSectionScreen(
+    modifier: Modifier,
+    section: BookRepository.HomeSection,
+    onBack: () -> Unit,
+    onBook: (BookRepository.CatalogItem) -> Unit
+) {
+    Column(
+        modifier = modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        TextButton(onClick = onBack) {
+            Icon(Icons.Default.ArrowBack, contentDescription = null)
+            Spacer(Modifier.size(6.dp))
+            Text("Назад")
+        }
+        Text(section.title, style = MaterialTheme.typography.headlineSmall)
+        LazyColumn(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            items(section.items, key = { "section-${it.type}-${it.id}" }) { book ->
+                Card(onClick = { onBook(book) }, modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        HomeCover(
+                            coverUrl = book.coverUrl,
+                            title = book.title,
+                            modifier = Modifier.width(72.dp).height(104.dp)
+                        )
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text(
+                                book.title,
+                                style = MaterialTheme.typography.titleMedium,
+                                maxLines = 3,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            if (book.authors.isNotEmpty()) {
+                                Text(
+                                    book.authors.joinToString(", "),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Text(
+                                if (book.type == ResourceType.BOOK) "Текстовая книга" else "Аудиокнига",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 }

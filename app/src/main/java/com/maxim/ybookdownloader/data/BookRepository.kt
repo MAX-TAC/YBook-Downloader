@@ -1,6 +1,5 @@
 package com.maxim.ybookdownloader.data
 
-import com.maxim.ybookdownloader.util.BookUrlParser
 import android.content.Context
 import com.maxim.ybookdownloader.util.BookReference
 import com.maxim.ybookdownloader.util.ResourceType
@@ -21,6 +20,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Element
 import retrofit2.Retrofit
 import java.io.File
 import java.util.Locale
@@ -96,6 +96,7 @@ class BookRepository(private val context: Context) {
 
     data class HomeSection(
         val title: String,
+        val url: String,
         val items: List<CatalogItem>
     )
 
@@ -260,10 +261,9 @@ class BookRepository(private val context: Context) {
                 put("cursor", cursor)
                 put("noMisspell", false)
                 put("query", query.trim())
-                put("types", buildJsonArray {
-                    add(JsonPrimitive("TextBook"))
-                    add(JsonPrimitive("AudioBook"))
-                })
+                // Gateway accepts the whitelisted Search query only with an empty
+                // types filter. Text/audio entities are filtered client-side below.
+                put("types", buildJsonArray { })
             })
         }
         val payload = buildJsonObject {
@@ -280,8 +280,17 @@ class BookRepository(private val context: Context) {
         check(response.isSuccessful) { "Ошибка поиска: HTTP ${response.code()}" }
         val body = response.body()?.string() ?: error("Пустой ответ поиска")
         val root = Json.parseToJsonElement(body).jsonObject
-        val search = root["data"]?.jsonObject?.get("search")?.jsonObject
-            ?: error("Некорректный ответ поиска")
+        val search = root["data"]?.let { it as? JsonObject }
+            ?.get("search")?.let { it as? JsonObject }
+        if (search == null) {
+            val apiMessage = (root["errors"] as? JsonArray)
+                ?.firstOrNull()
+                ?.let { it as? JsonObject }
+                ?.get("message")
+                ?.jsonPrimitive
+                ?.contentOrNull
+            error(apiMessage ?: "Некорректный ответ поиска")
+        }
         val candidates = (search["page"] as? JsonArray).orEmpty().mapNotNull(::parseSearchCandidate)
         val nextCursor = search["cursor"]?.jsonPrimitive?.contentOrNull.orEmpty()
 
@@ -304,7 +313,7 @@ class BookRepository(private val context: Context) {
                 )
             }
 
-        return CatalogPage(grouped, nextCursor, nextCursor.isNotBlank() && grouped.isNotEmpty())
+        return CatalogPage(grouped, nextCursor, nextCursor.isNotBlank() && nextCursor != cursor)
     }
 
     suspend fun getPopularSearches(token: String): List<String> {
@@ -327,20 +336,16 @@ class BookRepository(private val context: Context) {
 
     /**
      * Главная страница Яндекс Книг серверно рендерится и содержит ссылки на
-     * актуальные редакционные подборки. Для домашнего экрана читаем несколько
-     * первых разделов прямо с публичной страницы. Это недокументированный слой,
-     * поэтому при изменении HTML интерфейс просто покажет популярные запросы.
+     * актуальные редакционные подборки. Названия и карточки читаются из HTML,
+     * а недостающие данные первых карточек уточняются через REST API.
      */
-    suspend fun getHomeSections(): List<HomeSection> {
+    suspend fun getHomeSections(token: String): List<HomeSection> {
         val homeHtml = executeHtml(HOME_URL)
         val home = Jsoup.parse(homeHtml, HOME_URL)
         val sectionLinks = linkedMapOf<String, String>()
         home.select("a[href*='/section/all/']").forEach { anchor ->
-            val href = anchor.absUrl("href").ifBlank {
-                val raw = anchor.attr("href")
-                if (raw.startsWith("/")) "https://books.yandex.ru$raw" else raw
-            }
-            val title = anchor.text().trim()
+            val href = absoluteHref(anchor)
+            val title = cleanSectionTitle(anchor.text())
             if (href.isNotBlank() && title.isNotBlank() &&
                 !title.equals("Показать все", ignoreCase = true) && href !in sectionLinks
             ) {
@@ -348,10 +353,28 @@ class BookRepository(private val context: Context) {
             }
         }
 
-        return sectionLinks.entries.take(4).mapNotNull { (url, title) ->
+        return sectionLinks.entries.take(HOME_SECTION_COUNT).mapNotNull { (url, title) ->
             runCatching {
-                val items = parseSectionPage(url)
-                HomeSection(title, items)
+                val parsed = parseSectionPage(url, HOME_SECTION_MAX_ITEMS)
+                val enrichedPreview = parsed.take(HOME_PREVIEW_ITEMS).map { item ->
+                    if (!item.coverUrl.isNullOrBlank() && item.authors.isNotEmpty() && item.title != "Книга") {
+                        item
+                    } else {
+                        runCatching {
+                            val info = getResourceInfo(
+                                BookReference(item.id, item.sourceUrl, item.type),
+                                token
+                            )
+                            item.copy(
+                                title = info.title,
+                                coverUrl = info.coverUrl ?: item.coverUrl,
+                                authors = info.authors.ifEmpty { item.authors },
+                                workKey = makeWorkKey(info.title, info.authors.ifEmpty { item.authors })
+                            )
+                        }.getOrDefault(item)
+                    }
+                }
+                HomeSection(title = title, url = url, items = enrichedPreview + parsed.drop(HOME_PREVIEW_ITEMS))
             }.getOrNull()?.takeIf { it.items.isNotEmpty() }
         }
     }
@@ -368,42 +391,152 @@ class BookRepository(private val context: Context) {
         }
     }
 
-    private fun parseSectionPage(url: String): List<CatalogItem> {
+    private fun parseSectionPage(url: String, maxItems: Int): List<CatalogItem> {
         val doc = Jsoup.parse(executeHtml(url), url)
         val result = linkedMapOf<String, CatalogItem>()
+
         doc.select("a[href*='/books/'], a[href*='/audiobooks/']").forEach { anchor ->
-            if (result.size >= 12) return@forEach
-            val href = anchor.absUrl("href").ifBlank {
-                val raw = anchor.attr("href")
-                if (raw.startsWith("/")) "https://books.yandex.ru$raw" else raw
-            }
+            val href = absoluteHref(anchor)
             val ref = BookUrlParser.parse(href) ?: return@forEach
-            val img = anchor.selectFirst("img")
-            val alt = img?.attr("alt")?.trim().orEmpty()
-            val anchorText = anchor.text().trim()
-            val title = sequenceOf(alt, anchor.attr("aria-label"), anchor.attr("title"), anchorText)
-                .firstOrNull { it.isNotBlank() && !it.equals("book cover", true) && !it.equals("image", true) }
-                ?: "Книга"
-            val cover = sequenceOf(
-                img?.absUrl("src"),
-                img?.attr("data-src"),
-                img?.attr("src")
-            ).filterNotNull().firstOrNull { it.startsWith("http") }
             val key = "${ref.type}|${ref.id}"
-            result.putIfAbsent(
-                key,
-                CatalogItem(
-                    id = ref.id,
-                    type = ref.type,
-                    title = title,
-                    coverUrl = cover,
-                    authors = emptyList(),
-                    sourceUrl = href,
-                    workKey = makeWorkKey(title)
-                )
+            if (key !in result && result.size >= maxItems) return@forEach
+
+            val img = anchor.selectFirst("img") ?: findNearbyImage(anchor, ref)
+            val title = extractHomeBookTitle(anchor, img)
+            val cover = extractCoverUrl(anchor, img)
+            val authors = extractAuthorsNear(anchor, ref)
+
+            val previous = result[key]
+            val mergedTitle = when {
+                previous == null -> title
+                previous.title == "Книга" && title != "Книга" -> title
+                else -> previous.title
+            }
+            val mergedAuthors = previous?.authors?.takeIf { it.isNotEmpty() } ?: authors
+            result[key] = CatalogItem(
+                id = ref.id,
+                type = ref.type,
+                title = mergedTitle,
+                coverUrl = previous?.coverUrl ?: cover,
+                authors = mergedAuthors,
+                sourceUrl = href,
+                workKey = makeWorkKey(mergedTitle, mergedAuthors),
+                inLibrary = previous?.inLibrary ?: false
             )
         }
         return result.values.toList()
+    }
+
+    private fun cleanSectionTitle(raw: String): String = raw
+        .replace(Regex("\\s*(?:Показать\\s+все|Всё|Все)\\s*$", RegexOption.IGNORE_CASE), "")
+        .trim()
+
+    private fun absoluteHref(anchor: Element): String {
+        return anchor.absUrl("href").ifBlank {
+            val raw = anchor.attr("href").trim()
+            when {
+                raw.startsWith("//") -> "https:$raw"
+                raw.startsWith("/") -> "https://books.yandex.ru$raw"
+                else -> raw
+            }
+        }
+    }
+
+    private fun extractHomeBookTitle(anchor: Element, img: Element?): String {
+        val alt = img?.attr("alt")?.trim().orEmpty()
+        val anchorText = anchor.text().trim()
+        return sequenceOf(alt, anchor.attr("aria-label"), anchor.attr("title"), anchorText)
+            .map { it.trim() }
+            .firstOrNull {
+                it.isNotBlank() &&
+                    !it.equals("book cover", true) &&
+                    !it.equals("image", true) &&
+                    !it.equals("обложка", true)
+            }
+            ?: "Книга"
+    }
+
+    private fun findNearbyImage(anchor: Element, ref: BookReference): Element? {
+        var current: Element? = anchor.parent()
+        repeat(5) {
+            val node = current ?: return null
+            val refs = node.select("a[href*='/books/'], a[href*='/audiobooks/']")
+                .mapNotNull { BookUrlParser.parse(absoluteHref(it)) }
+                .map { "${it.type}|${it.id}" }
+                .distinct()
+            if (refs.size <= 2 && refs.any { it == "${ref.type}|${ref.id}" }) {
+                node.selectFirst("img")?.let { return it }
+            }
+            current = node.parent()
+        }
+        return null
+    }
+
+    private fun extractCoverUrl(anchor: Element, img: Element?): String? {
+        val candidates = mutableListOf<String>()
+        if (img != null) {
+            listOf("src", "data-src", "data-lazy-src").forEach { attr ->
+                img.attr(attr).takeIf { it.isNotBlank() }?.let(candidates::add)
+            }
+            listOf("srcset", "data-srcset").forEach { attr ->
+                img.attr(attr).takeIf { it.isNotBlank() }
+                    ?.let(::pickSrcSetUrl)
+                    ?.let(candidates::add)
+            }
+            img.parent()?.select("source[srcset], source[data-srcset]")?.forEach { source ->
+                sequenceOf(source.attr("srcset"), source.attr("data-srcset"))
+                    .firstOrNull { it.isNotBlank() }
+                    ?.let(::pickSrcSetUrl)
+                    ?.let(candidates::add)
+            }
+        }
+        anchor.select("source[srcset], source[data-srcset]").forEach { source ->
+            sequenceOf(source.attr("srcset"), source.attr("data-srcset"))
+                .firstOrNull { it.isNotBlank() }
+                ?.let(::pickSrcSetUrl)
+                ?.let(candidates::add)
+        }
+
+        return candidates.asSequence()
+            .mapNotNull(::normalizeImageUrl)
+            .firstOrNull()
+    }
+
+    private fun pickSrcSetUrl(value: String): String? = value
+        .split(',')
+        .map { it.trim().substringBefore(' ').trim() }
+        .filter { it.isNotBlank() }
+        .lastOrNull()
+
+    private fun normalizeImageUrl(raw: String): String? {
+        val value = raw.trim()
+        if (value.isBlank() || value.startsWith("data:", ignoreCase = true)) return null
+        return when {
+            value.startsWith("https://") || value.startsWith("http://") -> value
+            value.startsWith("//") -> "https:$value"
+            value.startsWith("/") -> "https://books.yandex.ru$value"
+            else -> null
+        }
+    }
+
+    private fun extractAuthorsNear(anchor: Element, ref: BookReference): List<String> {
+        var current: Element? = anchor.parent()
+        repeat(6) {
+            val node = current ?: return emptyList()
+            val refs = node.select("a[href*='/books/'], a[href*='/audiobooks/']")
+                .mapNotNull { BookUrlParser.parse(absoluteHref(it)) }
+                .map { "${it.type}|${it.id}" }
+                .distinct()
+            val authors = node.select("a[href*='/authors/']")
+                .map { it.text().trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
+            if (authors.isNotEmpty() && refs.size <= 2 && refs.any { it == "${ref.type}|${ref.id}" }) {
+                return authors
+            }
+            current = node.parent()
+        }
+        return emptyList()
     }
 
     private fun extractAuthors(resource: JsonObject): List<String> {
@@ -425,6 +558,9 @@ class BookRepository(private val context: Context) {
     companion object {
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private const val HOME_URL = "https://books.yandex.ru/"
+        private const val HOME_SECTION_COUNT = 4
+        private const val HOME_PREVIEW_ITEMS = 10
+        private const val HOME_SECTION_MAX_ITEMS = 40
 
         fun makeWorkKey(title: String, authors: List<String> = emptyList()): String {
             val authorPart = authors.firstOrNull().orEmpty()
