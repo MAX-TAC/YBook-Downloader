@@ -86,7 +86,9 @@ class BookRepository(private val context: Context) {
         val authors: List<String>,
         val sourceUrl: String,
         val workKey: String,
-        val inLibrary: Boolean = false
+        val inLibrary: Boolean = false,
+        val hasText: Boolean = type == ResourceType.BOOK,
+        val hasAudio: Boolean = type == ResourceType.AUDIOBOOK
     )
 
     data class CatalogPage(
@@ -310,7 +312,9 @@ class BookRepository(private val context: Context) {
                         "https://books.yandex.ru/books/${primary.id}"
                     else "https://books.yandex.ru/audiobooks/${primary.id}",
                     workKey = makeWorkKey(primary.title, primary.authors),
-                    inLibrary = versions.any { it.inLibrary }
+                    inLibrary = versions.any { it.inLibrary },
+                    hasText = versions.any { it.type == ResourceType.BOOK },
+                    hasAudio = versions.any { it.type == ResourceType.AUDIOBOOK }
                 )
             }
 
@@ -375,7 +379,8 @@ class BookRepository(private val context: Context) {
                         }.getOrDefault(item)
                     }
                 }
-                HomeSection(title = title, url = url, items = enrichedPreview + parsed.drop(HOME_PREVIEW_ITEMS))
+                val mergedItems = mergeCatalogVersions(enrichedPreview + parsed.drop(HOME_PREVIEW_ITEMS))
+                HomeSection(title = title, url = url, items = mergedItems)
             }.getOrNull()?.takeIf { it.items.isNotEmpty() }
         }
     }
@@ -422,10 +427,35 @@ class BookRepository(private val context: Context) {
                 authors = mergedAuthors,
                 sourceUrl = href,
                 workKey = makeWorkKey(mergedTitle, mergedAuthors),
-                inLibrary = previous?.inLibrary ?: false
+                inLibrary = previous?.inLibrary ?: false,
+                hasText = ref.type == ResourceType.BOOK,
+                hasAudio = ref.type == ResourceType.AUDIOBOOK
             )
         }
         return result.values.toList()
+    }
+
+    private fun mergeCatalogVersions(items: List<CatalogItem>): List<CatalogItem> {
+        if (items.isEmpty()) return emptyList()
+        return items
+            .groupBy { item ->
+                if (item.title == "Книга" || item.workKey.isBlank()) {
+                    "${item.type}|${item.id}"
+                } else {
+                    item.workKey
+                }
+            }
+            .values
+            .map { versions ->
+                val primary = versions.firstOrNull { it.type == ResourceType.BOOK } ?: versions.first()
+                primary.copy(
+                    coverUrl = primary.coverUrl ?: versions.firstNotNullOfOrNull { it.coverUrl },
+                    authors = primary.authors.ifEmpty { versions.flatMap { it.authors }.distinct() },
+                    inLibrary = versions.any { it.inLibrary },
+                    hasText = versions.any { it.hasText || it.type == ResourceType.BOOK },
+                    hasAudio = versions.any { it.hasAudio || it.type == ResourceType.AUDIOBOOK }
+                )
+            }
     }
 
     private fun cleanSectionTitle(raw: String): String = raw
@@ -634,6 +664,73 @@ class BookRepository(private val context: Context) {
             cardCount = cards.size,
             hasMore = cards.size >= limit
         )
+    }
+
+    /**
+     * В library_cards API добавляется именно UUID базовой книги (book_uuid).
+     * У ссылок на аудиокниги UUID может отличаться, поэтому для аудиоверсии
+     * сначала получаем канонический Book UUID через GraphQL Search.
+     */
+    suspend fun addResourceToLibrary(
+        resourceId: String,
+        resourceType: ResourceType,
+        title: String,
+        authors: List<String>,
+        token: String
+    ): Boolean {
+        val bookUuid = if (resourceType == ResourceType.BOOK) {
+            resourceId
+        } else {
+            findCanonicalBookUuid(title, authors, token) ?: resourceId
+        }
+        return addToLibrary(bookUuid, token)
+    }
+
+    private suspend fun findCanonicalBookUuid(
+        title: String,
+        authors: List<String>,
+        token: String
+    ): String? {
+        if (title.isBlank()) return null
+        val variables = buildJsonObject {
+            put("query", buildJsonObject {
+                put("cursor", "")
+                put("noMisspell", false)
+                put("query", title)
+                put("types", buildJsonArray { })
+            })
+        }
+        val payload = buildJsonObject {
+            put("operationName", "Search")
+            put("query", GQL_SEARCH)
+            put("variables", variables)
+        }.toString()
+
+        val response = api.postGraphQl(
+            BookmateApiFactory.GRAPHQL_URL,
+            token,
+            body = payload.toRequestBody(JSON_MEDIA_TYPE)
+        )
+        if (!response.isSuccessful) return null
+        val body = response.body()?.string() ?: return null
+        val root = runCatching { Json.parseToJsonElement(body).jsonObject }.getOrNull() ?: return null
+        val page = root["data"]?.let { it as? JsonObject }
+            ?.get("search")?.let { it as? JsonObject }
+            ?.get("page") as? JsonArray
+            ?: return null
+
+        val normalizedTitle = normalize(title)
+        val normalizedAuthors = authors.map(::normalize).filter { it.isNotBlank() }.toSet()
+
+        return page.mapNotNull(::parseSearchCandidate)
+            .asSequence()
+            .filter { normalize(it.title) == normalizedTitle }
+            .sortedByDescending { candidate ->
+                if (normalizedAuthors.isEmpty()) 0
+                else candidate.authors.map(::normalize).count { it in normalizedAuthors }
+            }
+            .firstOrNull()
+            ?.id
     }
 
     suspend fun addToLibrary(bookUuid: String, token: String): Boolean {

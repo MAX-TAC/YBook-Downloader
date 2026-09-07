@@ -197,7 +197,9 @@ data class FavoriteBookSummary(
     val coverUrl: String?,
     val authors: List<String>,
     val reference: BookReference,
-    val libraryCardUuids: List<String> = emptyList()
+    val libraryCardUuids: List<String> = emptyList(),
+    val hasText: Boolean = false,
+    val hasAudio: Boolean = false
 )
 
 private fun compactChapterList(numbers: List<Int>): String {
@@ -662,8 +664,10 @@ class MainViewModel : ViewModel() {
                 withContext(Dispatchers.IO) { repository.searchCatalog(clean, token, if (append) catalogCursor else "") }
             }.onSuccess { page ->
                 catalogResults = if (append) {
-                    (catalogResults + page.items).distinctBy { it.workKey.ifBlank { "${it.type}|${it.id}" } }
-                } else page.items
+                    mergeCatalogResults(catalogResults + page.items)
+                } else {
+                    mergeCatalogResults(page.items)
+                }
                 catalogCursor = page.cursor
                 catalogHasMore = page.hasMore
                 catalogBusy = false
@@ -676,6 +680,34 @@ class MainViewModel : ViewModel() {
 
     fun loadMoreCatalog() {
         if (catalogHasMore && !catalogBusy && catalogQuery.isNotBlank()) searchCatalog(catalogQuery, append = true)
+    }
+
+    private fun mergeCatalogResults(
+        items: List<BookRepository.CatalogItem>
+    ): List<BookRepository.CatalogItem> {
+        val merged = linkedMapOf<String, BookRepository.CatalogItem>()
+        items.forEach { item ->
+            val key = item.workKey.ifBlank { "${item.type}|${item.id}" }
+            val previous = merged[key]
+            if (previous == null) {
+                merged[key] = item
+            } else {
+                val primary = when {
+                    previous.type == ResourceType.BOOK -> previous
+                    item.type == ResourceType.BOOK -> item
+                    else -> previous
+                }
+                val secondary = if (primary === previous) item else previous
+                merged[key] = primary.copy(
+                    coverUrl = primary.coverUrl ?: secondary.coverUrl,
+                    authors = primary.authors.ifEmpty { secondary.authors },
+                    inLibrary = previous.inLibrary || item.inLibrary,
+                    hasText = previous.hasText || item.hasText,
+                    hasAudio = previous.hasAudio || item.hasAudio
+                )
+            }
+        }
+        return merged.values.toList()
     }
 
     fun openCatalogItem(item: BookRepository.CatalogItem) {
@@ -705,7 +737,13 @@ class MainViewModel : ViewModel() {
                         repository.removeFromLibrary(cardUuid, token)
                         false
                     } else {
-                        repository.addToLibrary(item.id, token)
+                        repository.addResourceToLibrary(
+                            resourceId = item.id,
+                            resourceType = item.type,
+                            title = item.title,
+                            authors = item.authors,
+                            token = token
+                        )
                         true
                     }
                 }
@@ -754,7 +792,16 @@ class MainViewModel : ViewModel() {
                         repository.removeFromLibrary(cardUuid, token)
                         false
                     } else {
-                        repository.addToLibrary(bookId, token)
+                        repository.addResourceToLibrary(
+                            resourceId = bookId,
+                            resourceType = if (state.textId != null && bookId == state.textId)
+                                ResourceType.BOOK
+                            else
+                                state.resourceType ?: ResourceType.BOOK,
+                            title = state.title.orEmpty(),
+                            authors = state.authors,
+                            token = token
+                        )
                         true
                     }
                 }
@@ -793,18 +840,18 @@ class MainViewModel : ViewModel() {
     fun loadFavorites(force: Boolean = false) {
         if (favoritesBusy) return
         if (force) {
-            loadFavoritesPage(replace = true)
+            loadFavoritesPage(replace = true, showPullRefresh = true)
         } else if (!favoritesLoaded) {
-            loadFavoritesPage(replace = true)
+            loadFavoritesPage(replace = true, showPullRefresh = false)
         }
     }
 
     fun loadMoreFavorites() {
         if (favoritesBusy || !favoritesHasMore) return
-        loadFavoritesPage(replace = false)
+        loadFavoritesPage(replace = false, showPullRefresh = false)
     }
 
-    private fun loadFavoritesPage(replace: Boolean) {
+    private fun loadFavoritesPage(replace: Boolean, showPullRefresh: Boolean) {
         if (favoritesBusy) return
         if (!replace && !favoritesHasMore) return
         val token = tokenStore.getToken() ?: run {
@@ -812,7 +859,7 @@ class MainViewModel : ViewModel() {
             return
         }
         favoritesBusy = true
-        favoritesRefreshing = replace && favoritesLoaded
+        favoritesRefreshing = showPullRefresh
         favoritesError = null
         val offset = if (replace) 0 else favoritesOffset
         viewModelScope.launch {
@@ -848,7 +895,9 @@ class MainViewModel : ViewModel() {
                     coverUrl = primary.coverUrl ?: items.firstNotNullOfOrNull { it.coverUrl },
                     authors = primary.authors.ifEmpty { items.flatMap { it.authors }.distinct() },
                     reference = BookReference(primary.id, primary.sourceUrl, primary.type),
-                    libraryCardUuids = items.mapNotNull { it.libraryCardUuid }.distinct()
+                    libraryCardUuids = items.mapNotNull { it.libraryCardUuid }.distinct(),
+                    hasText = items.any { it.type == ResourceType.BOOK },
+                    hasAudio = items.any { it.type == ResourceType.AUDIOBOOK }
                 )
             }
     }
@@ -1208,6 +1257,24 @@ fun YBookApp(
                             Icon(Icons.Default.DeleteOutline, contentDescription = "Очистить историю")
                         }
                     }
+                    if (bookDetailVisible && state.title != null) {
+                        IconButton(
+                            onClick = { vm.toggleCurrentFavorite() },
+                            enabled = !state.busy && !vm.currentFavoriteBusy
+                        ) {
+                            Icon(
+                                if (vm.currentInLibrary) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                                contentDescription = if (vm.currentInLibrary)
+                                    "Удалить из избранного"
+                                else
+                                    "Добавить в избранное",
+                                tint = if (vm.currentInLibrary)
+                                    MaterialTheme.colorScheme.primary
+                                else
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
                     IconButton(onClick = { showSettings = true }) {
                         Icon(Icons.Default.Settings, contentDescription = "Настройки")
                     }
@@ -1291,8 +1358,6 @@ fun YBookApp(
                 error = vm.catalogError,
                 hasMore = vm.catalogHasMore,
                 hasShareableFiles = shareable.isNotEmpty(),
-                currentInLibrary = vm.currentInLibrary,
-                favoriteBusy = vm.currentFavoriteBusy,
                 onSearch = {
                     vm.clearCurrentBook()
                     vm.searchCatalog(catalogInput)
@@ -1300,7 +1365,6 @@ fun YBookApp(
                 onOpenLink = { openLinkDialog() },
                 onOpenResult = { item -> openCatalogItem(item, AppSection.SEARCH) },
                 onToggleFavorite = vm::toggleCatalogFavorite,
-                onToggleCurrentFavorite = vm::toggleCurrentFavorite,
                 onLoadMore = vm::loadMoreCatalog,
                 onSelectType = vm::selectResourceType,
                 onDownload = {
@@ -1513,6 +1577,37 @@ private fun DiscoveryHomeScreen(
 }
 
 @Composable
+private fun MediaTypeIcons(
+    hasText: Boolean,
+    hasAudio: Boolean,
+    modifier: Modifier = Modifier
+) {
+    if (!hasText && !hasAudio) return
+    Row(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.spacedBy(7.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (hasText) {
+            Icon(
+                Icons.Default.MenuBook,
+                contentDescription = "Есть текстовая версия",
+                modifier = Modifier.size(18.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        if (hasAudio) {
+            Icon(
+                Icons.Default.Headphones,
+                contentDescription = "Есть аудиоверсия",
+                modifier = Modifier.size(18.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
 private fun HomeBookCard(book: BookRepository.CatalogItem, onClick: () -> Unit) {
     Card(
         onClick = onClick,
@@ -1539,10 +1634,14 @@ private fun HomeBookCard(book: BookRepository.CatalogItem, onClick: () -> Unit) 
                         book.authors.joinToString(", "),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 2,
+                        maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
                 }
+                MediaTypeIcons(
+                    hasText = book.hasText,
+                    hasAudio = book.hasAudio
+                )
             }
         }
     }
@@ -1615,10 +1714,9 @@ private fun HomeSectionScreen(
                                     overflow = TextOverflow.Ellipsis
                                 )
                             }
-                            Text(
-                                if (book.type == ResourceType.BOOK) "Текстовая книга" else "Аудиокнига",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            MediaTypeIcons(
+                                hasText = book.hasText,
+                                hasAudio = book.hasAudio
                             )
                         }
                         IconButton(onClick = { onToggleFavorite(book) }) {
@@ -1646,13 +1744,10 @@ private fun CatalogSearchScreen(
     error: String?,
     hasMore: Boolean,
     hasShareableFiles: Boolean,
-    currentInLibrary: Boolean,
-    favoriteBusy: Boolean,
     onSearch: () -> Unit,
     onOpenLink: () -> Unit,
     onOpenResult: (BookRepository.CatalogItem) -> Unit,
     onToggleFavorite: (BookRepository.CatalogItem) -> Unit,
-    onToggleCurrentFavorite: () -> Unit,
     onLoadMore: () -> Unit,
     onSelectType: (ResourceType) -> Unit,
     onDownload: () -> Unit,
@@ -1663,9 +1758,6 @@ private fun CatalogSearchScreen(
             modifier = modifier,
             state = state,
             hasShareableFiles = hasShareableFiles,
-            inLibrary = currentInLibrary,
-            favoriteBusy = favoriteBusy,
-            onToggleFavorite = onToggleCurrentFavorite,
             onSelectType = onSelectType,
             onDownload = onDownload,
             onShare = onShare
@@ -1768,10 +1860,9 @@ private fun CatalogResultCard(
                         maxLines = 2
                     )
                 }
-                Text(
-                    if (item.type == ResourceType.BOOK) "Текстовая книга" else "Аудиокнига",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                MediaTypeIcons(
+                    hasText = item.hasText,
+                    hasAudio = item.hasAudio
                 )
             }
             IconButton(onClick = onToggleFavorite) {
@@ -1790,9 +1881,6 @@ private fun BookDetailScreen(
     modifier: Modifier,
     state: BookUiState,
     hasShareableFiles: Boolean,
-    inLibrary: Boolean,
-    favoriteBusy: Boolean,
-    onToggleFavorite: () -> Unit,
     onSelectType: (ResourceType) -> Unit,
     onDownload: () -> Unit,
     onShare: () -> Unit
@@ -1841,19 +1929,6 @@ private fun BookDetailScreen(
                             modifier = Modifier.size(52.dp),
                             tint = MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                        FilledTonalIconButton(
-                            onClick = onToggleFavorite,
-                            enabled = !state.busy && !favoriteBusy,
-                            modifier = Modifier
-                                .align(Alignment.BottomEnd)
-                                .padding(6.dp)
-                        ) {
-                            Icon(
-                                if (inLibrary) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
-                                contentDescription = if (inLibrary) "Удалить из избранного" else "Добавить в избранное",
-                                tint = if (inLibrary) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
                     }
                     Spacer(Modifier.height(14.dp))
                     Text(
@@ -2117,7 +2192,9 @@ private fun FavoritesScreen(
                             onRemove = { onRemove(item) }
                         )
                     }
-                    if (hasMore || (busy && !refreshing && favoriteItems.isNotEmpty())) {
+                    if (favoriteItems.isNotEmpty() &&
+                        (hasMore || (busy && !refreshing))
+                    ) {
                         item(key = "favorites-more-${favoriteItems.size}") {
                             LaunchedEffect(favoriteItems.size, hasMore, busy, refreshing, query) {
                                 if (hasMore && !busy && !refreshing) onLoadMore()
@@ -2160,6 +2237,10 @@ private fun FavoriteBookCard(
                         maxLines = 2
                     )
                 }
+                MediaTypeIcons(
+                    hasText = item.hasText,
+                    hasAudio = item.hasAudio
+                )
             }
             IconButton(onClick = onRemove) {
                 Icon(
