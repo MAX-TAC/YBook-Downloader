@@ -17,7 +17,9 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.jsoup.Jsoup
 import retrofit2.Retrofit
 import java.io.File
 import java.util.Locale
@@ -26,9 +28,10 @@ import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
 
 class BookRepository(private val context: Context) {
+    private val webClient = OkHttpClient.Builder().build()
     private val api = Retrofit.Builder()
         .baseUrl(BookmateApiFactory.BASE_URL)
-        .client(OkHttpClient.Builder().build())
+        .client(webClient)
         .build()
         .create(BookmateApi::class.java)
 
@@ -63,7 +66,36 @@ class BookRepository(private val context: Context) {
         val authors: List<String>,
         val sourceUrl: String,
         val workKey: String,
-        val state: String? = null
+        val state: String? = null,
+        val libraryCardUuid: String? = null
+    )
+
+    data class LibraryPage(
+        val items: List<LibraryItem>,
+        val cardCount: Int,
+        val hasMore: Boolean
+    )
+
+    data class CatalogItem(
+        val id: String,
+        val type: ResourceType,
+        val title: String,
+        val coverUrl: String?,
+        val authors: List<String>,
+        val sourceUrl: String,
+        val workKey: String,
+        val inLibrary: Boolean = false
+    )
+
+    data class CatalogPage(
+        val items: List<CatalogItem>,
+        val cursor: String,
+        val hasMore: Boolean
+    )
+
+    data class HomeSection(
+        val title: String,
+        val items: List<CatalogItem>
     )
 
     private data class SearchCandidate(
@@ -71,7 +103,8 @@ class BookRepository(private val context: Context) {
         val id: String,
         val title: String,
         val coverUrl: String?,
-        val authors: List<String>
+        val authors: List<String>,
+        val inLibrary: Boolean = false
     )
 
     suspend fun getResourceInfo(ref: BookReference, token: String): ResourceInfo {
@@ -206,7 +239,170 @@ class BookRepository(private val context: Context) {
                 (author as? JsonObject)?.get("name")?.jsonPrimitive?.contentOrNull
             }
             .orEmpty()
-        return SearchCandidate(type, id, title, cover, authors)
+        val inLibrary = obj["progress"]
+            ?.let { it as? JsonObject }
+            ?.get("inLibrary")
+            ?.jsonPrimitive
+            ?.contentOrNull
+            ?.toBooleanStrictOrNull()
+            ?: false
+        return SearchCandidate(type, id, title, cover, authors, inLibrary)
+    }
+
+    suspend fun searchCatalog(
+        query: String,
+        token: String,
+        cursor: String = ""
+    ): CatalogPage {
+        val variables = buildJsonObject {
+            put("query", buildJsonObject {
+                put("cursor", cursor)
+                put("noMisspell", false)
+                put("query", query.trim())
+                put("types", buildJsonArray {
+                    add(JsonPrimitive("TextBook"))
+                    add(JsonPrimitive("AudioBook"))
+                })
+            })
+        }
+        val payload = buildJsonObject {
+            put("operationName", "Search")
+            put("query", GQL_SEARCH)
+            put("variables", variables)
+        }.toString()
+
+        val response = api.postGraphQl(
+            BookmateApiFactory.GRAPHQL_URL,
+            token,
+            body = payload.toRequestBody(JSON_MEDIA_TYPE)
+        )
+        check(response.isSuccessful) { "Ошибка поиска: HTTP ${response.code()}" }
+        val body = response.body()?.string() ?: error("Пустой ответ поиска")
+        val root = Json.parseToJsonElement(body).jsonObject
+        val search = root["data"]?.jsonObject?.get("search")?.jsonObject
+            ?: error("Некорректный ответ поиска")
+        val candidates = (search["page"] as? JsonArray).orEmpty().mapNotNull(::parseSearchCandidate)
+        val nextCursor = search["cursor"]?.jsonPrimitive?.contentOrNull.orEmpty()
+
+        val grouped = candidates
+            .groupBy { makeWorkKey(it.title, it.authors) }
+            .values
+            .map { versions ->
+                val primary = versions.firstOrNull { it.type == ResourceType.BOOK } ?: versions.first()
+                CatalogItem(
+                    id = primary.id,
+                    type = primary.type,
+                    title = primary.title,
+                    coverUrl = primary.coverUrl ?: versions.firstNotNullOfOrNull { it.coverUrl },
+                    authors = primary.authors.ifEmpty { versions.flatMap { it.authors }.distinct() },
+                    sourceUrl = if (primary.type == ResourceType.BOOK)
+                        "https://books.yandex.ru/books/${primary.id}"
+                    else "https://books.yandex.ru/audiobooks/${primary.id}",
+                    workKey = makeWorkKey(primary.title, primary.authors),
+                    inLibrary = versions.any { it.inLibrary }
+                )
+            }
+
+        return CatalogPage(grouped, nextCursor, nextCursor.isNotBlank() && grouped.isNotEmpty())
+    }
+
+    suspend fun getPopularSearches(token: String): List<String> {
+        val response = api.getPopularSearches(token = token)
+        if (!response.isSuccessful) return emptyList()
+        val body = response.body()?.string() ?: return emptyList()
+        val root = runCatching { Json.parseToJsonElement(body).jsonObject }.getOrNull() ?: return emptyList()
+        val arrays = sequenceOf(root["popular_searches"], root["data"], root["searches"])
+            .mapNotNull { it as? JsonArray }
+        return arrays.firstOrNull()?.mapNotNull { item ->
+            when (item) {
+                is JsonPrimitive -> item.contentOrNull
+                is JsonObject -> sequenceOf("query", "text", "title", "name")
+                    .mapNotNull { key -> item[key]?.jsonPrimitive?.contentOrNull }
+                    .firstOrNull { it.isNotBlank() }
+                else -> null
+            }
+        }?.filter { it.isNotBlank() }?.distinct()?.take(12).orEmpty()
+    }
+
+    /**
+     * Главная страница Яндекс Книг серверно рендерится и содержит ссылки на
+     * актуальные редакционные подборки. Для домашнего экрана читаем несколько
+     * первых разделов прямо с публичной страницы. Это недокументированный слой,
+     * поэтому при изменении HTML интерфейс просто покажет популярные запросы.
+     */
+    suspend fun getHomeSections(): List<HomeSection> {
+        val homeHtml = executeHtml(HOME_URL)
+        val home = Jsoup.parse(homeHtml, HOME_URL)
+        val sectionLinks = linkedMapOf<String, String>()
+        home.select("a[href*='/section/all/']").forEach { anchor ->
+            val href = anchor.absUrl("href").ifBlank {
+                val raw = anchor.attr("href")
+                if (raw.startsWith("/")) "https://books.yandex.ru$raw" else raw
+            }
+            val title = anchor.text().trim()
+            if (href.isNotBlank() && title.isNotBlank() &&
+                !title.equals("Показать все", ignoreCase = true) && href !in sectionLinks
+            ) {
+                sectionLinks[href] = title
+            }
+        }
+
+        return sectionLinks.entries.take(4).mapNotNull { (url, title) ->
+            runCatching {
+                val items = parseSectionPage(url)
+                HomeSection(title, items)
+            }.getOrNull()?.takeIf { it.items.isNotEmpty() }
+        }
+    }
+
+    private fun executeHtml(url: String): String {
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/126 Mobile Safari/537.36")
+            .header("Accept-Language", "ru-RU,ru;q=0.9")
+            .build()
+        webClient.newCall(request).execute().use { response ->
+            check(response.isSuccessful) { "Ошибка загрузки главной: HTTP ${response.code}" }
+            return response.body?.string() ?: error("Пустая страница Яндекс Книг")
+        }
+    }
+
+    private fun parseSectionPage(url: String): List<CatalogItem> {
+        val doc = Jsoup.parse(executeHtml(url), url)
+        val result = linkedMapOf<String, CatalogItem>()
+        doc.select("a[href*='/books/'], a[href*='/audiobooks/']").forEach { anchor ->
+            if (result.size >= 12) return@forEach
+            val href = anchor.absUrl("href").ifBlank {
+                val raw = anchor.attr("href")
+                if (raw.startsWith("/")) "https://books.yandex.ru$raw" else raw
+            }
+            val ref = BookUrlParser.parse(href) ?: return@forEach
+            val img = anchor.selectFirst("img")
+            val alt = img?.attr("alt")?.trim().orEmpty()
+            val anchorText = anchor.text().trim()
+            val title = sequenceOf(alt, anchor.attr("aria-label"), anchor.attr("title"), anchorText)
+                .firstOrNull { it.isNotBlank() && !it.equals("book cover", true) && !it.equals("image", true) }
+                ?: "Книга"
+            val cover = sequenceOf(
+                img?.absUrl("src"),
+                img?.attr("data-src"),
+                img?.attr("src")
+            ).filterNotNull().firstOrNull { it.startsWith("http") }
+            val key = "${ref.type}|${ref.id}"
+            result.putIfAbsent(
+                key,
+                CatalogItem(
+                    id = ref.id,
+                    type = ref.type,
+                    title = title,
+                    coverUrl = cover,
+                    authors = emptyList(),
+                    sourceUrl = href,
+                    workKey = makeWorkKey(title)
+                )
+            )
+        }
+        return result.values.toList()
     }
 
     private fun extractAuthors(resource: JsonObject): List<String> {
@@ -227,6 +423,7 @@ class BookRepository(private val context: Context) {
 
     companion object {
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        private const val HOME_URL = "https://books.yandex.ru/"
 
         fun makeWorkKey(title: String, authors: List<String> = emptyList()): String {
             val authorPart = authors.firstOrNull().orEmpty()
@@ -278,42 +475,67 @@ class BookRepository(private val context: Context) {
         return file
     }
 
-    /**
-     * Загружает личную библиотеку авторизованного аккаунта. В Яндекс Книгах
-     * сохранённые/избранные произведения представлены карточками profile/library_cards.
-     * API может вернуть текстовую книгу, аудиокнигу или обе сущности.
-     */
-    suspend fun getMyLibrary(token: String): List<LibraryItem> {
-        val result = mutableListOf<LibraryItem>()
-        var offset = 0
-        val limit = 100
-
-        while (true) {
-            val response = api.getLibraryCards(token = token, limit = limit, offset = offset)
-            check(response.isSuccessful) { "Ошибка библиотеки: HTTP ${response.code()}" }
-            val body = response.body()?.string() ?: error("Пустой ответ библиотеки")
-            val root = Json.parseToJsonElement(body).jsonObject
-            val cards = (root["library_cards"] as? JsonArray).orEmpty()
-
-            cards.forEach { element ->
-                val card = element as? JsonObject ?: return@forEach
-                val state = card["state"]?.jsonPrimitive?.contentOrNull
-                parseLibraryResource(card["book"], ResourceType.BOOK, state)?.let(result::add)
-                parseLibraryResource(card["audiobook"], ResourceType.AUDIOBOOK, state)?.let(result::add)
-            }
-
-            if (cards.size < limit) break
-            offset += cards.size
-            if (cards.isEmpty()) break
+    /** Одна страница личной библиотеки. Небольшой pageSize нужен, чтобы
+     * корректно работать даже если сервер сам ограничивает максимальный limit. */
+    suspend fun getMyLibraryPage(token: String, limit: Int = 20, offset: Int = 0): LibraryPage {
+        val response = api.getLibraryCards(token = token, limit = limit, offset = offset)
+        check(response.isSuccessful) { "Ошибка библиотеки: HTTP ${response.code()}" }
+        val body = response.body()?.string() ?: error("Пустой ответ библиотеки")
+        val root = Json.parseToJsonElement(body).jsonObject
+        val cards = (root["library_cards"] as? JsonArray).orEmpty()
+        val items = mutableListOf<LibraryItem>()
+        cards.forEach { element ->
+            val card = element as? JsonObject ?: return@forEach
+            val cardUuid = card["uuid"]?.jsonPrimitive?.contentOrNull
+            val state = card["state"]?.jsonPrimitive?.contentOrNull
+            parseLibraryResource(card["book"], ResourceType.BOOK, state, cardUuid)?.let(items::add)
+            parseLibraryResource(card["audiobook"], ResourceType.AUDIOBOOK, state, cardUuid)?.let(items::add)
         }
+        return LibraryPage(
+            items = items.distinctBy { "${it.type}|${it.id}" },
+            cardCount = cards.size,
+            hasMore = cards.size >= limit
+        )
+    }
 
-        return result.distinctBy { "${it.type}|${it.id}" }
+    suspend fun addToLibrary(bookUuid: String, token: String): Boolean {
+        val payload = buildJsonObject { put("book_uuid", bookUuid) }.toString()
+        val response = api.addLibraryCard(
+            token = token,
+            body = payload.toRequestBody(JSON_MEDIA_TYPE)
+        )
+        check(response.isSuccessful) { "Не удалось добавить в избранное: HTTP ${response.code()}" }
+        return true
+    }
+
+    suspend fun removeFromLibrary(cardUuid: String, token: String): Boolean {
+        val response = api.removeLibraryCard(cardUuid = cardUuid, token = token)
+        check(response.isSuccessful) { "Не удалось удалить из избранного: HTTP ${response.code()}" }
+        return true
+    }
+
+    suspend fun findLibraryCardUuid(
+        bookId: String,
+        token: String,
+        workKey: String = ""
+    ): String? {
+        var offset = 0
+        val limit = 20
+        while (true) {
+            val page = getMyLibraryPage(token, limit, offset)
+            page.items.firstOrNull {
+                it.id == bookId || (workKey.isNotBlank() && it.workKey == workKey)
+            }?.libraryCardUuid?.let { return it }
+            if (!page.hasMore || page.cardCount == 0) return null
+            offset += page.cardCount
+        }
     }
 
     private fun parseLibraryResource(
         element: JsonElement?,
         type: ResourceType,
-        state: String?
+        state: String?,
+        libraryCardUuid: String?
     ): LibraryItem? {
         val resource = element as? JsonObject ?: return null
         val id = resource["uuid"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: return null
@@ -339,7 +561,8 @@ class BookRepository(private val context: Context) {
             authors = authors,
             sourceUrl = sourceUrl,
             workKey = makeWorkKey(title, authors),
-            state = state
+            state = state,
+            libraryCardUuid = libraryCardUuid
         )
     }
 

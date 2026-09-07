@@ -26,16 +26,22 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.MenuBook
@@ -179,7 +185,8 @@ data class FavoriteBookSummary(
     val title: String,
     val coverUrl: String?,
     val authors: List<String>,
-    val reference: BookReference
+    val reference: BookReference,
+    val libraryCardUuids: List<String> = emptyList()
 )
 
 private fun compactChapterList(numbers: List<Int>): String {
@@ -224,7 +231,33 @@ class MainViewModel : ViewModel() {
     var favoritesError by mutableStateOf<String?>(null)
         private set
 
+    var favoritesHasMore by mutableStateOf(true)
+        private set
+
+    private var favoritesOffset = 0
     private var favoritesLoaded = false
+
+    var catalogQuery by mutableStateOf("")
+        private set
+    var catalogResults by mutableStateOf<List<BookRepository.CatalogItem>>(emptyList())
+        private set
+    var catalogBusy by mutableStateOf(false)
+        private set
+    var catalogError by mutableStateOf<String?>(null)
+        private set
+    var catalogHasMore by mutableStateOf(false)
+        private set
+    private var catalogCursor = ""
+
+    var homeSections by mutableStateOf<List<BookRepository.HomeSection>>(emptyList())
+        private set
+    var popularSearches by mutableStateOf<List<String>>(emptyList())
+        private set
+    var homeBusy by mutableStateOf(false)
+        private set
+    var homeError by mutableStateOf<String?>(null)
+        private set
+    private var homeLoaded = false
 
     fun init(context: Context) {
         if (!::repository.isInitialized) {
@@ -561,18 +594,132 @@ class MainViewModel : ViewModel() {
         loadBook(reference)
     }
 
+    fun loadHome(force: Boolean = false) {
+        if (homeBusy || (homeLoaded && !force)) return
+        val token = tokenStore.getToken() ?: return
+        homeBusy = true
+        homeError = null
+        viewModelScope.launch {
+            val sectionsResult = runCatching { withContext(Dispatchers.IO) { repository.getHomeSections() } }
+            val popularResult = runCatching { withContext(Dispatchers.IO) { repository.getPopularSearches(token) } }
+            homeSections = sectionsResult.getOrDefault(emptyList())
+            popularSearches = popularResult.getOrDefault(emptyList())
+            homeLoaded = true
+            homeBusy = false
+            if (homeSections.isEmpty() && popularSearches.isEmpty()) {
+                homeError = sectionsResult.exceptionOrNull()?.message ?: "Не удалось загрузить подборки"
+            }
+        }
+    }
+
+    fun searchCatalog(query: String, append: Boolean = false) {
+        val clean = query.trim()
+        if (clean.isBlank() || catalogBusy) return
+        val token = tokenStore.getToken() ?: run {
+            catalogError = "Сессия Яндекса не найдена. Войдите заново."
+            return
+        }
+        if (!append) {
+            catalogQuery = clean
+            catalogResults = emptyList()
+            catalogCursor = ""
+            catalogHasMore = false
+        } else if (clean != catalogQuery || !catalogHasMore) {
+            return
+        }
+        catalogBusy = true
+        catalogError = null
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) { repository.searchCatalog(clean, token, if (append) catalogCursor else "") }
+            }.onSuccess { page ->
+                catalogResults = if (append) {
+                    (catalogResults + page.items).distinctBy { it.workKey.ifBlank { "${it.type}|${it.id}" } }
+                } else page.items
+                catalogCursor = page.cursor
+                catalogHasMore = page.hasMore
+                catalogBusy = false
+            }.onFailure {
+                catalogBusy = false
+                catalogError = it.message ?: "Ошибка поиска"
+            }
+        }
+    }
+
+    fun loadMoreCatalog() {
+        if (catalogHasMore && !catalogBusy && catalogQuery.isNotBlank()) searchCatalog(catalogQuery, append = true)
+    }
+
+    fun openCatalogItem(item: BookRepository.CatalogItem) {
+        loadBook(BookReference(item.id, item.sourceUrl, item.type))
+    }
+
+    fun clearCurrentBook() {
+        epubFile = null
+        textInfo = null
+        audioInfo = null
+        state = BookUiState()
+    }
+
+    fun toggleCatalogFavorite(item: BookRepository.CatalogItem) {
+        val token = tokenStore.getToken() ?: return
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    if (item.inLibrary) {
+                        val cachedCard = favorites.firstOrNull {
+                            it.id == item.id || it.workKey == item.workKey
+                        }?.libraryCardUuid
+                        val cardUuid = cachedCard ?: repository.findLibraryCardUuid(item.id, token, item.workKey)
+                            ?: error("Не удалось найти запись книги в избранном")
+                        repository.removeFromLibrary(cardUuid, token)
+                        false
+                    } else {
+                        repository.addToLibrary(item.id, token)
+                        true
+                    }
+                }
+            }.onSuccess { nowInLibrary ->
+                catalogResults = catalogResults.map { current ->
+                    if (current.workKey == item.workKey) current.copy(inLibrary = nowInLibrary) else current
+                }
+                favoritesLoaded = false
+                favorites = emptyList()
+                favoritesOffset = 0
+                favoritesHasMore = true
+                state = state.copy(message = if (nowInLibrary) "Добавлено в избранное" else "Удалено из избранного")
+            }.onFailure { showError(it.message ?: "Не удалось изменить избранное") }
+        }
+    }
+
     fun loadFavorites(force: Boolean = false) {
-        if (favoritesBusy || (favoritesLoaded && !force)) return
+        if (favoritesBusy) return
+        if (force) {
+            favorites = emptyList()
+            favoritesOffset = 0
+            favoritesHasMore = true
+            favoritesLoaded = false
+        } else if (favoritesLoaded) {
+            return
+        }
+        loadMoreFavorites()
+    }
+
+    fun loadMoreFavorites() {
+        if (favoritesBusy || !favoritesHasMore) return
         val token = tokenStore.getToken() ?: run {
             favoritesError = "Сессия Яндекса не найдена. Войдите заново."
             return
         }
         favoritesBusy = true
         favoritesError = null
+        val offset = favoritesOffset
         viewModelScope.launch {
-            runCatching { withContext(Dispatchers.IO) { repository.getMyLibrary(token) } }
-                .onSuccess { items ->
-                    favorites = items
+            runCatching { withContext(Dispatchers.IO) { repository.getMyLibraryPage(token, limit = 20, offset = offset) } }
+                .onSuccess { page ->
+                    favorites = (favorites + page.items).distinctBy { "${it.type}|${it.id}" }
+                    favoritesOffset += page.cardCount
+                    favoritesHasMore = page.hasMore && page.cardCount > 0
                     favoritesLoaded = true
                     favoritesBusy = false
                 }
@@ -593,14 +740,37 @@ class MainViewModel : ViewModel() {
                     title = primary.title,
                     coverUrl = primary.coverUrl ?: items.firstNotNullOfOrNull { it.coverUrl },
                     authors = primary.authors.ifEmpty { items.flatMap { it.authors }.distinct() },
-                    reference = BookReference(primary.id, primary.sourceUrl, primary.type)
+                    reference = BookReference(primary.id, primary.sourceUrl, primary.type),
+                    libraryCardUuids = items.mapNotNull { it.libraryCardUuid }.distinct()
                 )
             }
-            .sortedBy { it.title.lowercase(Locale.getDefault()) }
     }
 
     fun openFavorite(item: FavoriteBookSummary) {
         loadBook(item.reference)
+    }
+
+    fun removeFavorite(item: FavoriteBookSummary) {
+        val token = tokenStore.getToken() ?: return
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    val cardIds = item.libraryCardUuids.ifEmpty {
+                        listOfNotNull(repository.findLibraryCardUuid(item.reference.id, token, item.key))
+                    }
+                    check(cardIds.isNotEmpty()) { "Не удалось определить запись в избранном" }
+                    cardIds.forEach { repository.removeFromLibrary(it, token) }
+                }
+            }.onSuccess {
+                favorites = favorites.filterNot {
+                    it.workKey == item.key || it.libraryCardUuid in item.libraryCardUuids
+                }
+                catalogResults = catalogResults.map { result ->
+                    if (result.workKey == item.key) result.copy(inLibrary = false) else result
+                }
+                state = state.copy(message = "Удалено из избранного")
+            }.onFailure { showError(it.message ?: "Не удалось удалить из избранного") }
+        }
     }
 
     /**
@@ -708,7 +878,16 @@ class MainViewModel : ViewModel() {
         audioInfo = null
         favorites = emptyList()
         favoritesLoaded = false
+        favoritesOffset = 0
+        favoritesHasMore = true
         favoritesError = null
+        catalogResults = emptyList()
+        catalogQuery = ""
+        catalogCursor = ""
+        catalogHasMore = false
+        homeSections = emptyList()
+        popularSearches = emptyList()
+        homeLoaded = false
         state = BookUiState()
     }
 
@@ -742,7 +921,7 @@ class MainViewModel : ViewModel() {
     }
 }
 
-private enum class AppSection { HOME, FAVORITES, HISTORY }
+private enum class AppSection { HOME, SEARCH, FAVORITES, HISTORY }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -757,7 +936,7 @@ fun YBookApp(
 
     var authenticated by remember { mutableStateOf(vm.hasToken()) }
     var selectedSection by remember { mutableStateOf(AppSection.HOME) }
-    var showSearchDialog by remember { mutableStateOf(false) }
+    var showLinkDialog by remember { mutableStateOf(false) }
     var showFormats by remember { mutableStateOf(false) }
     var showAudioQuality by remember { mutableStateOf(false) }
     var showAudioChapters by remember { mutableStateOf(false) }
@@ -765,7 +944,8 @@ fun YBookApp(
     var audioTracks by remember { mutableStateOf<List<BookRepository.AudioTrack>>(emptyList()) }
     var showShareDialog by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
-    var searchInput by remember { mutableStateOf("") }
+    var linkInput by remember { mutableStateOf("") }
+    var catalogInput by remember { mutableStateOf("") }
     var pendingStorageAction by remember { mutableStateOf<(() -> Unit)?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
     val state = vm.state
@@ -776,6 +956,7 @@ fun YBookApp(
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && vm.hasToken()) {
             authenticated = true
+            vm.loadHome(force = true)
         }
     }
 
@@ -784,11 +965,8 @@ fun YBookApp(
     ) { granted ->
         val action = pendingStorageAction
         pendingStorageAction = null
-        if (granted) {
-            action?.invoke()
-        } else {
-            vm.showError("Без доступа к файлам Android 8/9 не может сохранить файл в папку Загрузки")
-        }
+        if (granted) action?.invoke()
+        else vm.showError("Без доступа к файлам Android 8/9 не может сохранить файл в папку Загрузки")
     }
 
     fun runWithStorageAccess(action: () -> Unit) {
@@ -797,31 +975,36 @@ fun YBookApp(
                 context,
                 Manifest.permission.WRITE_EXTERNAL_STORAGE
             ) != PackageManager.PERMISSION_GRANTED
-
         if (needsLegacyPermission) {
             pendingStorageAction = action
             storagePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-        } else {
-            action()
-        }
+        } else action()
     }
 
-    fun openSearch(clearOldValue: Boolean = true) {
-        if (clearOldValue) searchInput = ""
-        showSearchDialog = true
+    fun openLinkDialog(clearOldValue: Boolean = true) {
+        if (clearOldValue) linkInput = ""
+        showLinkDialog = true
+    }
+
+    fun openCatalogItem(item: BookRepository.CatalogItem) {
+        selectedSection = AppSection.SEARCH
+        vm.openCatalogItem(item)
     }
 
     LaunchedEffect(initialText, authenticated) {
         if (authenticated && !initialText.isNullOrBlank()) {
-            selectedSection = AppSection.HOME
-            searchInput = initialText
+            selectedSection = AppSection.SEARCH
+            linkInput = initialText
             vm.loadFromText(initialText)
         }
     }
 
-    LaunchedEffect(selectedSection, authenticated) {
-        if (authenticated && selectedSection == AppSection.FAVORITES) {
-            vm.loadFavorites()
+    LaunchedEffect(authenticated, selectedSection) {
+        if (!authenticated) return@LaunchedEffect
+        when (selectedSection) {
+            AppSection.HOME -> vm.loadHome()
+            AppSection.FAVORITES -> vm.loadFavorites()
+            else -> Unit
         }
     }
 
@@ -834,9 +1017,7 @@ fun YBookApp(
     }
 
     if (!authenticated) {
-        LoginScreen(
-            onLogin = { authLauncher.launch(Intent(context, AuthActivity::class.java)) }
-        )
+        LoginScreen(onLogin = { authLauncher.launch(Intent(context, AuthActivity::class.java)) })
         return
     }
 
@@ -851,15 +1032,6 @@ fun YBookApp(
                 }
             )
         },
-        floatingActionButton = {
-            if (selectedSection == AppSection.HOME && state.title != null && !state.busy) {
-                FloatingActionButton(
-                    onClick = { openSearch() },
-                ) {
-                    Icon(Icons.Default.Search, contentDescription = "Найти другую книгу")
-                }
-            }
-        },
         bottomBar = {
             NavigationBar {
                 NavigationBarItem(
@@ -867,6 +1039,12 @@ fun YBookApp(
                     onClick = { selectedSection = AppSection.HOME },
                     icon = { Icon(Icons.Default.Home, contentDescription = null) },
                     label = { Text("Главная") }
+                )
+                NavigationBarItem(
+                    selected = selectedSection == AppSection.SEARCH,
+                    onClick = { selectedSection = AppSection.SEARCH },
+                    icon = { Icon(Icons.Default.Search, contentDescription = null) },
+                    label = { Text("Поиск") }
                 )
                 NavigationBarItem(
                     selected = selectedSection == AppSection.FAVORITES,
@@ -885,11 +1063,46 @@ fun YBookApp(
         snackbarHost = { SnackbarHost(snackbarHostState) }
     ) { padding ->
         when (selectedSection) {
-            AppSection.HOME -> HomeScreen(
+            AppSection.HOME -> DiscoveryHomeScreen(
                 modifier = Modifier.padding(padding),
+                sections = vm.homeSections,
+                popularSearches = vm.popularSearches,
+                recent = vm.historyBooks().take(8),
+                busy = vm.homeBusy,
+                error = vm.homeError,
+                onRefresh = { vm.loadHome(force = true) },
+                onBook = ::openCatalogItem,
+                onPopularSearch = { query ->
+                    catalogInput = query
+                    vm.clearCurrentBook()
+                    vm.searchCatalog(query)
+                    selectedSection = AppSection.SEARCH
+                },
+                onRecent = { item ->
+                    selectedSection = AppSection.SEARCH
+                    vm.openHistoryBook(item)
+                }
+            )
+
+            AppSection.SEARCH -> CatalogSearchScreen(
+                modifier = Modifier.padding(padding),
+                input = catalogInput,
+                onInputChange = { catalogInput = it },
                 state = state,
+                results = vm.catalogResults,
+                busy = vm.catalogBusy,
+                error = vm.catalogError,
+                hasMore = vm.catalogHasMore,
                 hasShareableFiles = shareable.isNotEmpty(),
-                onSearch = { openSearch() },
+                onSearch = {
+                    vm.clearCurrentBook()
+                    vm.searchCatalog(catalogInput)
+                },
+                onOpenLink = { openLinkDialog() },
+                onOpenResult = vm::openCatalogItem,
+                onToggleFavorite = vm::toggleCatalogFavorite,
+                onLoadMore = vm::loadMoreCatalog,
+                onBackToResults = vm::clearCurrentBook,
                 onSelectType = vm::selectResourceType,
                 onDownload = {
                     if (state.resourceType == ResourceType.AUDIOBOOK) showAudioQuality = true
@@ -903,9 +1116,12 @@ fun YBookApp(
                 favoriteItems = vm.favoriteWorks(),
                 busy = vm.favoritesBusy,
                 error = vm.favoritesError,
+                hasMore = vm.favoritesHasMore,
                 onRefresh = { vm.loadFavorites(force = true) },
+                onLoadMore = vm::loadMoreFavorites,
+                onRemove = vm::removeFavorite,
                 onOpen = { item ->
-                    selectedSection = AppSection.HOME
+                    selectedSection = AppSection.SEARCH
                     vm.openFavorite(item)
                 }
             )
@@ -914,7 +1130,7 @@ fun YBookApp(
                 modifier = Modifier.padding(padding),
                 items = vm.historyBooks(),
                 onOpen = { item ->
-                    selectedSection = AppSection.HOME
+                    selectedSection = AppSection.SEARCH
                     vm.openHistoryBook(item)
                 },
                 onClear = { vm.clearHistory() }
@@ -922,29 +1138,24 @@ fun YBookApp(
         }
     }
 
-    if (showSearchDialog) {
+    if (showLinkDialog) {
         SearchBookDialog(
-            value = searchInput,
+            value = linkInput,
             busy = state.busy,
-            onValueChange = { searchInput = it },
+            onValueChange = { linkInput = it },
             onPaste = {
                 val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                val text = clipboard.primaryClip
-                    ?.getItemAt(0)
-                    ?.coerceToText(context)
-                    ?.toString()
-                    .orEmpty()
-                if (text.isBlank()) vm.showError("Буфер обмена пуст") else searchInput = text
+                val text = clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString().orEmpty()
+                if (text.isBlank()) vm.showError("Буфер обмена пуст") else linkInput = text
             },
-            onDismiss = { if (!state.busy) showSearchDialog = false },
+            onDismiss = { if (!state.busy) showLinkDialog = false },
             onSearch = {
-                val ref = BookUrlParser.parse(searchInput)
-                if (ref == null) {
-                    vm.showError("Не удалось распознать ссылку из Яндекс Книг")
-                } else {
-                    vm.setUrl(searchInput)
-                    showSearchDialog = false
-                    selectedSection = AppSection.HOME
+                val ref = BookUrlParser.parse(linkInput)
+                if (ref == null) vm.showError("Не удалось распознать ссылку из Яндекс Книг")
+                else {
+                    vm.setUrl(linkInput)
+                    showLinkDialog = false
+                    selectedSection = AppSection.SEARCH
                     vm.loadBook(ref)
                 }
             }
@@ -1020,11 +1231,295 @@ fun YBookApp(
 }
 
 @Composable
-private fun HomeScreen(
+private fun DiscoveryHomeScreen(
+    modifier: Modifier,
+    sections: List<BookRepository.HomeSection>,
+    popularSearches: List<String>,
+    recent: List<HistoryBookSummary>,
+    busy: Boolean,
+    error: String?,
+    onRefresh: () -> Unit,
+    onBook: (BookRepository.CatalogItem) -> Unit,
+    onPopularSearch: (String) -> Unit,
+    onRecent: (HistoryBookSummary) -> Unit
+) {
+    LazyColumn(
+        modifier = modifier.fillMaxSize(),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp)
+    ) {
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text("Главная", style = MaterialTheme.typography.headlineSmall)
+                    Text(
+                        "Подборки и рекомендации Яндекс Книг",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                IconButton(onClick = onRefresh, enabled = !busy) {
+                    Icon(Icons.Default.Refresh, contentDescription = "Обновить подборки")
+                }
+            }
+        }
+
+        if (busy) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+
+        if (popularSearches.isNotEmpty()) {
+            item { Text("Популярные запросы", style = MaterialTheme.typography.titleLarge) }
+            item {
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(popularSearches) { query ->
+                        OutlinedButton(onClick = { onPopularSearch(query) }) { Text(query) }
+                    }
+                }
+            }
+        }
+
+        sections.forEach { section ->
+            item(key = "title-${section.title}") {
+                Text(section.title, style = MaterialTheme.typography.titleLarge)
+            }
+            item(key = "row-${section.title}") {
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    items(section.items, key = { "${it.type}-${it.id}" }) { book ->
+                        HomeBookCard(book = book, onClick = { onBook(book) })
+                    }
+                }
+            }
+        }
+
+        if (recent.isNotEmpty()) {
+            item { Text("Недавно скачанные", style = MaterialTheme.typography.titleLarge) }
+            item {
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    items(recent, key = { it.key }) { book ->
+                        RecentBookCard(book = book, onClick = { onRecent(book) })
+                    }
+                }
+            }
+        }
+
+        if (!busy && sections.isEmpty() && popularSearches.isEmpty()) {
+            item {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(
+                        Modifier.padding(18.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("Подборки пока недоступны", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            error ?: "Яндекс изменил структуру главной страницы. Поиск, избранное и история продолжат работать.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        TextButton(onClick = onRefresh) { Text("Повторить") }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HomeBookCard(book: BookRepository.CatalogItem, onClick: () -> Unit) {
+    Card(onClick = onClick, modifier = Modifier.width(132.dp)) {
+        Column {
+            if (!book.coverUrl.isNullOrBlank()) {
+                AsyncImage(
+                    model = book.coverUrl,
+                    contentDescription = book.title,
+                    modifier = Modifier.fillMaxWidth().height(184.dp)
+                )
+            } else {
+                Box(
+                    modifier = Modifier.fillMaxWidth().height(184.dp),
+                    contentAlignment = Alignment.Center
+                ) { Icon(Icons.Default.MenuBook, contentDescription = null, modifier = Modifier.size(44.dp)) }
+            }
+            Text(
+                book.title,
+                modifier = Modifier.padding(9.dp),
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 3
+            )
+        }
+    }
+}
+
+@Composable
+private fun RecentBookCard(book: HistoryBookSummary, onClick: () -> Unit) {
+    Card(onClick = onClick, modifier = Modifier.width(132.dp)) {
+        Column {
+            if (!book.coverUrl.isNullOrBlank()) {
+                AsyncImage(
+                    model = book.coverUrl,
+                    contentDescription = book.title,
+                    modifier = Modifier.fillMaxWidth().height(184.dp)
+                )
+            } else {
+                Box(
+                    modifier = Modifier.fillMaxWidth().height(184.dp),
+                    contentAlignment = Alignment.Center
+                ) { Icon(Icons.Default.MenuBook, contentDescription = null, modifier = Modifier.size(44.dp)) }
+            }
+            Text(book.title, modifier = Modifier.padding(9.dp), style = MaterialTheme.typography.bodyMedium, maxLines = 3)
+        }
+    }
+}
+
+@Composable
+private fun CatalogSearchScreen(
+    modifier: Modifier,
+    input: String,
+    onInputChange: (String) -> Unit,
+    state: BookUiState,
+    results: List<BookRepository.CatalogItem>,
+    busy: Boolean,
+    error: String?,
+    hasMore: Boolean,
+    hasShareableFiles: Boolean,
+    onSearch: () -> Unit,
+    onOpenLink: () -> Unit,
+    onOpenResult: (BookRepository.CatalogItem) -> Unit,
+    onToggleFavorite: (BookRepository.CatalogItem) -> Unit,
+    onLoadMore: () -> Unit,
+    onBackToResults: () -> Unit,
+    onSelectType: (ResourceType) -> Unit,
+    onDownload: () -> Unit,
+    onShare: () -> Unit
+) {
+    if (state.title != null || (state.busy && state.url.isNotBlank())) {
+        BookDetailScreen(
+            modifier = modifier,
+            state = state,
+            hasShareableFiles = hasShareableFiles,
+            onBack = onBackToResults,
+            onSelectType = onSelectType,
+            onDownload = onDownload,
+            onShare = onShare
+        )
+        return
+    }
+
+    Column(
+        modifier = modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Text("Поиск", style = MaterialTheme.typography.headlineSmall)
+        OutlinedTextField(
+            value = input,
+            onValueChange = onInputChange,
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("Название книги или автор") },
+            leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+            trailingIcon = {
+                if (input.isNotEmpty()) {
+                    IconButton(onClick = { onInputChange("") }) {
+                        Icon(Icons.Default.Clear, contentDescription = "Очистить")
+                    }
+                }
+            }
+        )
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = onSearch, enabled = input.isNotBlank() && !busy, modifier = Modifier.weight(1f)) {
+                Text("Найти")
+            }
+            OutlinedButton(onClick = onOpenLink, modifier = Modifier.weight(1f)) {
+                Icon(Icons.Default.Link, contentDescription = null)
+                Spacer(Modifier.size(6.dp))
+                Text("По ссылке")
+            }
+        }
+
+        if (busy && results.isEmpty()) LinearProgressIndicator(Modifier.fillMaxWidth())
+        error?.let {
+            Card(Modifier.fillMaxWidth()) {
+                Text(it, Modifier.padding(14.dp), color = MaterialTheme.colorScheme.error)
+            }
+        }
+
+        if (!busy && error == null && input.isNotBlank() && results.isEmpty()) {
+            Text(
+                "Введите запрос и нажмите «Найти». Также можно открыть книгу по ссылке из Яндекс Книг.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        LazyColumn(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            items(results, key = { it.workKey.ifBlank { "${it.type}|${it.id}" } }) { item ->
+                CatalogResultCard(item, { onOpenResult(item) }, { onToggleFavorite(item) })
+            }
+            if (hasMore || (busy && results.isNotEmpty())) {
+                item(key = "catalog-more-${results.size}") {
+                    LaunchedEffect(results.size, hasMore, busy) {
+                        if (hasMore && !busy) onLoadMore()
+                    }
+                    if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                    else Spacer(Modifier.height(8.dp))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CatalogResultCard(
+    item: BookRepository.CatalogItem,
+    onOpen: () -> Unit,
+    onToggleFavorite: () -> Unit
+) {
+    Card(onClick = onOpen, modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            if (!item.coverUrl.isNullOrBlank()) {
+                AsyncImage(model = item.coverUrl, contentDescription = "Обложка", modifier = Modifier.size(72.dp))
+            }
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(item.title, style = MaterialTheme.typography.titleMedium)
+                if (item.authors.isNotEmpty()) {
+                    Text(
+                        item.authors.joinToString(", "),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2
+                    )
+                }
+                Text(
+                    if (item.type == ResourceType.BOOK) "Текстовая книга" else "Аудиокнига",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            IconButton(onClick = onToggleFavorite) {
+                Icon(
+                    if (item.inLibrary) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                    contentDescription = if (item.inLibrary) "Удалить из избранного" else "Добавить в избранное",
+                    tint = if (item.inLibrary) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun BookDetailScreen(
     modifier: Modifier,
     state: BookUiState,
     hasShareableFiles: Boolean,
-    onSearch: () -> Unit,
+    onBack: () -> Unit,
     onSelectType: (ResourceType) -> Unit,
     onDownload: () -> Unit,
     onShare: () -> Unit
@@ -1036,6 +1531,12 @@ private fun HomeScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        TextButton(onClick = onBack, enabled = !state.busy) {
+            Icon(Icons.Default.ArrowBack, contentDescription = null)
+            Spacer(Modifier.size(6.dp))
+            Text("Назад к поиску")
+        }
+
         if (state.busy) {
             LinearProgressIndicator(Modifier.fillMaxWidth())
             state.progressLabel?.let {
@@ -1048,32 +1549,6 @@ private fun HomeScreen(
         }
 
         val title = state.title
-        if (title == null && !state.busy) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 72.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Card(Modifier.fillMaxWidth()) {
-                    Column(
-                        modifier = Modifier.padding(24.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(16.dp)
-                    ) {
-                        Text("Найдите книгу", style = MaterialTheme.typography.headlineSmall)
-                        Text(
-                            "Подойдёт ссылка как на текстовую, так и на аудиоверсию из приложения «Яндекс Книги». Доступные варианты приложение найдёт само.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            textAlign = TextAlign.Center
-                        )
-                        Button(onClick = onSearch, modifier = Modifier.fillMaxWidth()) {
-                            Text("Найти")
-                        }
-                    }
-                }
-            }
-        }
 
         title?.let {
             Card(Modifier.fillMaxWidth()) {
@@ -1287,10 +1762,14 @@ private fun FavoritesScreen(
     favoriteItems: List<FavoriteBookSummary>,
     busy: Boolean,
     error: String?,
+    hasMore: Boolean,
     onRefresh: () -> Unit,
+    onLoadMore: () -> Unit,
+    onRemove: (FavoriteBookSummary) -> Unit,
     onOpen: (FavoriteBookSummary) -> Unit
 ) {
     var query by remember { mutableStateOf("") }
+    var pendingRemove by remember { mutableStateOf<FavoriteBookSummary?>(null) }
     val normalizedQuery = remember(query) { BookRepository.normalize(query) }
     val filtered = remember(favoriteItems, normalizedQuery) {
         if (normalizedQuery.isBlank()) favoriteItems
@@ -1301,9 +1780,7 @@ private fun FavoritesScreen(
     }
 
     Column(
-        modifier = modifier
-            .fillMaxSize()
-            .padding(16.dp),
+        modifier = modifier.fillMaxSize().padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Row(
@@ -1311,7 +1788,14 @@ private fun FavoritesScreen(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("Избранное", style = MaterialTheme.typography.headlineSmall)
+            Column {
+                Text("Избранное", style = MaterialTheme.typography.headlineSmall)
+                Text(
+                    "${favoriteItems.size} загружено${if (hasMore) " • листайте вниз для подгрузки" else ""}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
             IconButton(onClick = onRefresh, enabled = !busy) {
                 Icon(Icons.Default.Refresh, contentDescription = "Обновить")
             }
@@ -1333,17 +1817,11 @@ private fun FavoritesScreen(
             }
         )
 
-        if (busy) {
-            LinearProgressIndicator(Modifier.fillMaxWidth())
-        }
+        if (busy && favoriteItems.isEmpty()) LinearProgressIndicator(Modifier.fillMaxWidth())
 
         error?.let {
             Card(Modifier.fillMaxWidth()) {
-                Text(
-                    it,
-                    modifier = Modifier.padding(16.dp),
-                    color = MaterialTheme.colorScheme.error
-                )
+                Text(it, modifier = Modifier.padding(16.dp), color = MaterialTheme.colorScheme.error)
             }
         }
 
@@ -1360,15 +1838,47 @@ private fun FavoritesScreen(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 items(filtered, key = { it.key }) { item ->
-                    FavoriteBookCard(item = item, onClick = { onOpen(item) })
+                    FavoriteBookCard(
+                        item = item,
+                        onClick = { onOpen(item) },
+                        onRemove = { pendingRemove = item }
+                    )
+                }
+                if (hasMore || (busy && favoriteItems.isNotEmpty())) {
+                    item(key = "favorites-more-${favoriteItems.size}") {
+                        LaunchedEffect(favoriteItems.size, hasMore, busy, query) {
+                            if (hasMore && !busy) onLoadMore()
+                        }
+                        if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                        else Spacer(Modifier.height(8.dp))
+                    }
                 }
             }
         }
     }
+
+    pendingRemove?.let { item ->
+        AlertDialog(
+            onDismissRequest = { pendingRemove = null },
+            title = { Text("Удалить из избранного?") },
+            text = { Text("«${item.title}» будет удалена из библиотеки Яндекс Книг.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingRemove = null
+                    onRemove(item)
+                }) { Text("Удалить") }
+            },
+            dismissButton = { TextButton(onClick = { pendingRemove = null }) { Text("Отмена") } }
+        )
+    }
 }
 
 @Composable
-private fun FavoriteBookCard(item: FavoriteBookSummary, onClick: () -> Unit) {
+private fun FavoriteBookCard(
+    item: FavoriteBookSummary,
+    onClick: () -> Unit,
+    onRemove: () -> Unit
+) {
     Card(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier.padding(12.dp),
@@ -1392,6 +1902,9 @@ private fun FavoriteBookCard(item: FavoriteBookSummary, onClick: () -> Unit) {
                     )
                 }
             }
+            IconButton(onClick = onRemove) {
+                Icon(Icons.Default.DeleteOutline, contentDescription = "Удалить из избранного")
+            }
         }
     }
 }
@@ -1407,7 +1920,7 @@ private fun SearchBookDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Найти книгу") },
+        title = { Text("Открыть по ссылке") },
         text = {
             OutlinedTextField(
                 value = value,
@@ -1437,7 +1950,7 @@ private fun SearchBookDialog(
             )
         },
         confirmButton = {
-            Button(onClick = onSearch, enabled = value.isNotBlank() && !busy) { Text("Найти") }
+            Button(onClick = onSearch, enabled = value.isNotBlank() && !busy) { Text("Открыть") }
         },
         dismissButton = {
             TextButton(onClick = onDismiss, enabled = !busy) { Text("Отмена") }

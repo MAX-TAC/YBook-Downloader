@@ -4,6 +4,7 @@ import okhttp3.RequestBody
 import okhttp3.ResponseBody
 import retrofit2.Response
 import retrofit2.http.Body
+import retrofit2.http.DELETE
 import retrofit2.http.GET
 import retrofit2.http.Header
 import retrofit2.http.POST
@@ -44,8 +45,30 @@ interface BookmateApi {
     suspend fun getLibraryCards(
         @Header("auth-token") token: String,
         @Header("app-user-agent") appUserAgent: String = BookmateApiFactory.APP_USER_AGENT,
-        @Query("limit") limit: Int = 100,
+        @Query("limit") limit: Int = 20,
         @Query("offset") offset: Int = 0
+    ): Response<ResponseBody>
+
+    @POST("profile/library_cards")
+    suspend fun addLibraryCard(
+        @Header("auth-token") token: String,
+        @Header("app-user-agent") appUserAgent: String = BookmateApiFactory.APP_USER_AGENT,
+        @Body body: RequestBody
+    ): Response<ResponseBody>
+
+    @DELETE("profile/library_cards/{uuid}")
+    suspend fun removeLibraryCard(
+        @Path("uuid") cardUuid: String,
+        @Header("auth-token") token: String,
+        @Header("app-user-agent") appUserAgent: String = BookmateApiFactory.APP_USER_AGENT
+    ): Response<ResponseBody>
+
+    @GET("popular_searches/{language}")
+    suspend fun getPopularSearches(
+        @Path("language") language: String = "ru",
+        @Header("auth-token") token: String,
+        @Header("app-user-agent") appUserAgent: String = BookmateApiFactory.APP_USER_AGENT,
+        @Query("page") page: Int = 1
     ): Response<ResponseBody>
 
     @GET
