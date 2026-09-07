@@ -11,6 +11,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -54,6 +55,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -701,6 +703,15 @@ class MainViewModel : ViewModel() {
                 catalogResults = catalogResults.map { current ->
                     if (current.workKey == item.workKey) current.copy(inLibrary = nowInLibrary) else current
                 }
+                homeSections = homeSections.map { section ->
+                    section.copy(
+                        items = section.items.map { current ->
+                            if (current.workKey == item.workKey ||
+                                (current.type == item.type && current.id == item.id)
+                            ) current.copy(inLibrary = nowInLibrary) else current
+                        }
+                    )
+                }
                 favoritesLoaded = false
                 favorites = emptyList()
                 favoritesOffset = 0
@@ -744,6 +755,15 @@ class MainViewModel : ViewModel() {
                     if (workKey.isNotBlank() && current.workKey == workKey) {
                         current.copy(inLibrary = nowInLibrary)
                     } else current
+                }
+                homeSections = homeSections.map { section ->
+                    section.copy(
+                        items = section.items.map { current ->
+                            if (workKey.isNotBlank() && current.workKey == workKey) {
+                                current.copy(inLibrary = nowInLibrary)
+                            } else current
+                        }
+                    )
                 }
                 // Следующее открытие вкладки «Избранное» перечитает библиотеку с сервера.
                 favoritesLoaded = false
@@ -835,6 +855,13 @@ class MainViewModel : ViewModel() {
                 }
                 catalogResults = catalogResults.map { result ->
                     if (result.workKey == item.key) result.copy(inLibrary = false) else result
+                }
+                homeSections = homeSections.map { section ->
+                    section.copy(
+                        items = section.items.map { result ->
+                            if (result.workKey == item.key) result.copy(inLibrary = false) else result
+                        }
+                    )
                 }
                 state = state.copy(message = "Удалено из избранного")
             }.onFailure { showError(it.message ?: "Не удалось удалить из избранного") }
@@ -1006,7 +1033,9 @@ fun YBookApp(
 
     var authenticated by remember { mutableStateOf(vm.hasToken()) }
     var selectedSection by remember { mutableStateOf(AppSection.HOME) }
-    var selectedHomeSection by remember { mutableStateOf<BookRepository.HomeSection?>(null) }
+    var selectedHomeSectionTitle by remember { mutableStateOf<String?>(null) }
+    var bookReturnSection by remember { mutableStateOf(AppSection.SEARCH) }
+    var bookReturnHomeSectionTitle by remember { mutableStateOf<String?>(null) }
     var showLinkDialog by remember { mutableStateOf(false) }
     var showFormats by remember { mutableStateOf(false) }
     var showAudioQuality by remember { mutableStateOf(false) }
@@ -1057,13 +1086,45 @@ fun YBookApp(
         showLinkDialog = true
     }
 
-    fun openCatalogItem(item: BookRepository.CatalogItem) {
+    fun openCatalogItem(
+        item: BookRepository.CatalogItem,
+        returnSection: AppSection,
+        returnHomeSectionTitle: String? = null
+    ) {
+        bookReturnSection = returnSection
+        bookReturnHomeSectionTitle = if (returnSection == AppSection.HOME) returnHomeSectionTitle else null
         selectedSection = AppSection.SEARCH
         vm.openCatalogItem(item)
     }
 
+    fun navigateBackFromBook() {
+        vm.clearCurrentBook()
+        selectedSection = bookReturnSection
+        selectedHomeSectionTitle = if (bookReturnSection == AppSection.HOME) {
+            bookReturnHomeSectionTitle
+        } else {
+            null
+        }
+    }
+
+    val bookDetailVisible = selectedSection == AppSection.SEARCH &&
+        (state.title != null || (state.busy && state.url.isNotBlank()))
+
+    BackHandler(enabled = bookDetailVisible) {
+        navigateBackFromBook()
+    }
+    BackHandler(
+        enabled = !bookDetailVisible &&
+            selectedSection == AppSection.HOME &&
+            selectedHomeSectionTitle != null
+    ) {
+        selectedHomeSectionTitle = null
+    }
+
     LaunchedEffect(initialText, authenticated) {
         if (authenticated && !initialText.isNullOrBlank()) {
+            bookReturnSection = AppSection.SEARCH
+            bookReturnHomeSectionTitle = null
             selectedSection = AppSection.SEARCH
             linkInput = initialText
             vm.loadFromText(initialText)
@@ -1096,7 +1157,32 @@ fun YBookApp(
         topBar = {
             TopAppBar(
                 title = { Text("YBook Downloader") },
+                navigationIcon = {
+                    when {
+                        bookDetailVisible -> {
+                            FilledTonalIconButton(
+                                onClick = { navigateBackFromBook() },
+                                enabled = !state.busy
+                            ) {
+                                Icon(Icons.Default.ArrowBack, contentDescription = "Назад")
+                            }
+                        }
+                        selectedSection == AppSection.HOME && selectedHomeSectionTitle != null -> {
+                            FilledTonalIconButton(onClick = { selectedHomeSectionTitle = null }) {
+                                Icon(Icons.Default.ArrowBack, contentDescription = "Назад")
+                            }
+                        }
+                    }
+                },
                 actions = {
+                    if (selectedSection == AppSection.HOME && selectedHomeSectionTitle == null) {
+                        IconButton(
+                            onClick = { vm.loadHome(force = true) },
+                            enabled = !vm.homeBusy
+                        ) {
+                            Icon(Icons.Default.Refresh, contentDescription = "Обновить главную")
+                        }
+                    }
                     if (selectedSection == AppSection.FAVORITES) {
                         IconButton(
                             onClick = { vm.loadFavorites(force = true) },
@@ -1122,7 +1208,7 @@ fun YBookApp(
                     selected = selectedSection == AppSection.HOME,
                     onClick = {
                         selectedSection = AppSection.HOME
-                        selectedHomeSection = null
+                        selectedHomeSectionTitle = null
                     },
                     icon = { Icon(Icons.Default.Home, contentDescription = null) },
                     label = { Text("Главная") }
@@ -1151,13 +1237,17 @@ fun YBookApp(
     ) { padding ->
         when (selectedSection) {
             AppSection.HOME -> {
-                val openedSection = selectedHomeSection
+                val openedSection = selectedHomeSectionTitle?.let { title ->
+                    vm.homeSections.firstOrNull { it.title == title }
+                }
                 if (openedSection != null) {
                     HomeSectionScreen(
                         modifier = Modifier.padding(padding),
                         section = openedSection,
-                        onBack = { selectedHomeSection = null },
-                        onBook = ::openCatalogItem
+                        onBook = { item ->
+                            openCatalogItem(item, AppSection.HOME, openedSection.title)
+                        },
+                        onToggleFavorite = vm::toggleCatalogFavorite
                     )
                 } else {
                     DiscoveryHomeScreen(
@@ -1167,8 +1257,8 @@ fun YBookApp(
                         busy = vm.homeBusy,
                         error = vm.homeError,
                         onRefresh = { vm.loadHome(force = true) },
-                        onBook = ::openCatalogItem,
-                        onOpenSection = { selectedHomeSection = it },
+                        onBook = { item -> openCatalogItem(item, AppSection.HOME) },
+                        onOpenSection = { selectedHomeSectionTitle = it.title },
                         onPopularSearch = { query ->
                             catalogInput = query
                             vm.clearCurrentBook()
@@ -1196,11 +1286,10 @@ fun YBookApp(
                     vm.searchCatalog(catalogInput)
                 },
                 onOpenLink = { openLinkDialog() },
-                onOpenResult = vm::openCatalogItem,
+                onOpenResult = { item -> openCatalogItem(item, AppSection.SEARCH) },
                 onToggleFavorite = vm::toggleCatalogFavorite,
                 onToggleCurrentFavorite = vm::toggleCurrentFavorite,
                 onLoadMore = vm::loadMoreCatalog,
-                onBackToResults = vm::clearCurrentBook,
                 onSelectType = vm::selectResourceType,
                 onDownload = {
                     if (state.resourceType == ResourceType.AUDIOBOOK) showAudioQuality = true
@@ -1218,6 +1307,8 @@ fun YBookApp(
                 onLoadMore = vm::loadMoreFavorites,
                 onRemove = vm::removeFavorite,
                 onOpen = { item ->
+                    bookReturnSection = AppSection.FAVORITES
+                    bookReturnHomeSectionTitle = null
                     selectedSection = AppSection.SEARCH
                     vm.openFavorite(item)
                 }
@@ -1227,6 +1318,8 @@ fun YBookApp(
                 modifier = Modifier.padding(padding),
                 items = vm.historyBooks(),
                 onOpen = { item ->
+                    bookReturnSection = AppSection.HISTORY
+                    bookReturnHomeSectionTitle = null
                     selectedSection = AppSection.SEARCH
                     vm.openHistoryBook(item)
                 }
@@ -1251,6 +1344,8 @@ fun YBookApp(
                 else {
                     vm.setUrl(linkInput)
                     showLinkDialog = false
+                    bookReturnSection = AppSection.SEARCH
+                    bookReturnHomeSectionTitle = null
                     selectedSection = AppSection.SEARCH
                     vm.loadBook(ref)
                 }
@@ -1343,26 +1438,6 @@ private fun DiscoveryHomeScreen(
         contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp)
     ) {
-        item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column {
-                    Text("Главная", style = MaterialTheme.typography.headlineSmall)
-                    Text(
-                        "Подборки и рекомендации Яндекс Книг",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                IconButton(onClick = onRefresh, enabled = !busy) {
-                    Icon(Icons.Default.Refresh, contentDescription = "Обновить подборки")
-                }
-            }
-        }
-
         if (busy) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
 
         if (popularSearches.isNotEmpty()) {
@@ -1476,18 +1551,13 @@ private fun HomeCover(
 private fun HomeSectionScreen(
     modifier: Modifier,
     section: BookRepository.HomeSection,
-    onBack: () -> Unit,
-    onBook: (BookRepository.CatalogItem) -> Unit
+    onBook: (BookRepository.CatalogItem) -> Unit,
+    onToggleFavorite: (BookRepository.CatalogItem) -> Unit
 ) {
     Column(
         modifier = modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        TextButton(onClick = onBack) {
-            Icon(Icons.Default.ArrowBack, contentDescription = null)
-            Spacer(Modifier.size(6.dp))
-            Text("Назад")
-        }
         Text(section.title, style = MaterialTheme.typography.headlineSmall)
         LazyColumn(
             modifier = Modifier.weight(1f),
@@ -1530,6 +1600,13 @@ private fun HomeSectionScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
+                        IconButton(onClick = { onToggleFavorite(book) }) {
+                            Icon(
+                                if (book.inLibrary) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                                contentDescription = if (book.inLibrary) "Удалить из избранного" else "Добавить в избранное",
+                                tint = if (book.inLibrary) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     }
                 }
             }
@@ -1556,7 +1633,6 @@ private fun CatalogSearchScreen(
     onToggleFavorite: (BookRepository.CatalogItem) -> Unit,
     onToggleCurrentFavorite: () -> Unit,
     onLoadMore: () -> Unit,
-    onBackToResults: () -> Unit,
     onSelectType: (ResourceType) -> Unit,
     onDownload: () -> Unit,
     onShare: () -> Unit
@@ -1568,7 +1644,6 @@ private fun CatalogSearchScreen(
             hasShareableFiles = hasShareableFiles,
             inLibrary = currentInLibrary,
             favoriteBusy = favoriteBusy,
-            onBack = onBackToResults,
             onToggleFavorite = onToggleCurrentFavorite,
             onSelectType = onSelectType,
             onDownload = onDownload,
@@ -1596,15 +1671,20 @@ private fun CatalogSearchScreen(
                 }
             }
         )
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = onSearch, enabled = input.isNotBlank() && !busy, modifier = Modifier.weight(1f)) {
-                Text("Найти")
-            }
-            OutlinedButton(onClick = onOpenLink, modifier = Modifier.weight(1f)) {
-                Icon(Icons.Default.Link, contentDescription = null)
-                Spacer(Modifier.size(6.dp))
-                Text("По ссылке")
-            }
+        Button(
+            onClick = onSearch,
+            enabled = input.isNotBlank() && !(busy && results.isEmpty()),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Найти")
+        }
+        OutlinedButton(
+            onClick = onOpenLink,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Icon(Icons.Default.Link, contentDescription = null)
+            Spacer(Modifier.size(6.dp))
+            Text("Поиск по ссылке")
         }
 
         if (busy && results.isEmpty()) LinearProgressIndicator(Modifier.fillMaxWidth())
@@ -1691,7 +1771,6 @@ private fun BookDetailScreen(
     hasShareableFiles: Boolean,
     inLibrary: Boolean,
     favoriteBusy: Boolean,
-    onBack: () -> Unit,
     onToggleFavorite: () -> Unit,
     onSelectType: (ResourceType) -> Unit,
     onDownload: () -> Unit,
@@ -1704,12 +1783,6 @@ private fun BookDetailScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        TextButton(onClick = onBack, enabled = !state.busy) {
-            Icon(Icons.Default.ArrowBack, contentDescription = null)
-            Spacer(Modifier.size(6.dp))
-            Text("Назад к поиску")
-        }
-
         if (state.busy) {
             LinearProgressIndicator(Modifier.fillMaxWidth())
             state.progressLabel?.let {
@@ -1730,12 +1803,36 @@ private fun BookDetailScreen(
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Spacer(Modifier.height(18.dp))
-                    state.coverUrl?.let { cover ->
-                        AsyncImage(
-                            model = cover,
-                            contentDescription = "Обложка",
-                            modifier = Modifier.size(190.dp)
+                    Box(
+                        modifier = Modifier.size(190.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        state.coverUrl?.let { cover ->
+                            AsyncImage(
+                                model = cover,
+                                contentDescription = "Обложка",
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = ContentScale.Crop
+                            )
+                        } ?: Icon(
+                            Icons.Default.MenuBook,
+                            contentDescription = null,
+                            modifier = Modifier.size(52.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                        FilledTonalIconButton(
+                            onClick = onToggleFavorite,
+                            enabled = !state.busy && !favoriteBusy,
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .padding(6.dp)
+                        ) {
+                            Icon(
+                                if (inLibrary) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                                contentDescription = if (inLibrary) "Удалить из избранного" else "Добавить в избранное",
+                                tint = if (inLibrary) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     }
                     Spacer(Modifier.height(14.dp))
                     Text(
@@ -1752,18 +1849,7 @@ private fun BookDetailScreen(
                             textAlign = TextAlign.Center
                         )
                     }
-                    Spacer(Modifier.height(8.dp))
-                    IconButton(
-                        onClick = onToggleFavorite,
-                        enabled = !state.busy && !favoriteBusy
-                    ) {
-                        Icon(
-                            if (inLibrary) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
-                            contentDescription = if (inLibrary) "Удалить из избранного" else "Добавить в избранное",
-                            tint = if (inLibrary) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Spacer(Modifier.height(10.dp))
+                    Spacer(Modifier.height(18.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -1942,7 +2028,6 @@ private fun FavoritesScreen(
     onOpen: (FavoriteBookSummary) -> Unit
 ) {
     var query by remember { mutableStateOf("") }
-    var pendingRemove by remember { mutableStateOf<FavoriteBookSummary?>(null) }
     val normalizedQuery = remember(query) { BookRepository.normalize(query) }
     val filtered = remember(favoriteItems, normalizedQuery) {
         if (normalizedQuery.isBlank()) favoriteItems
@@ -1961,7 +2046,7 @@ private fun FavoritesScreen(
             onValueChange = { query = it },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
-            label = { Text("Поиск по названию или автору") },
+            label = { Text("Поиск в избранном") },
             leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
             trailingIcon = {
                 if (query.isNotEmpty()) {
@@ -1996,7 +2081,7 @@ private fun FavoritesScreen(
                     FavoriteBookCard(
                         item = item,
                         onClick = { onOpen(item) },
-                        onRemove = { pendingRemove = item }
+                        onRemove = { onRemove(item) }
                     )
                 }
                 if (hasMore || (busy && favoriteItems.isNotEmpty())) {
@@ -2012,20 +2097,6 @@ private fun FavoritesScreen(
         }
     }
 
-    pendingRemove?.let { item ->
-        AlertDialog(
-            onDismissRequest = { pendingRemove = null },
-            title = { Text("Удалить из избранного?") },
-            text = { Text("«${item.title}» будет удалена из библиотеки Яндекс Книг.") },
-            confirmButton = {
-                TextButton(onClick = {
-                    pendingRemove = null
-                    onRemove(item)
-                }) { Text("Удалить") }
-            },
-            dismissButton = { TextButton(onClick = { pendingRemove = null }) { Text("Отмена") } }
-        )
-    }
 }
 
 @Composable
@@ -2058,7 +2129,11 @@ private fun FavoriteBookCard(
                 }
             }
             IconButton(onClick = onRemove) {
-                Icon(Icons.Default.DeleteOutline, contentDescription = "Удалить из избранного")
+                Icon(
+                    Icons.Default.Favorite,
+                    contentDescription = "Удалить из избранного",
+                    tint = MaterialTheme.colorScheme.primary
+                )
             }
         }
     }
