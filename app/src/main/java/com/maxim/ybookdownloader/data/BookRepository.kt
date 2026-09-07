@@ -43,6 +43,7 @@ class BookRepository(private val context: Context) {
         val title: String,
         val coverUrl: String?,
         val authors: List<String> = emptyList(),
+        val narrators: List<String> = emptyList(),
         val rawJson: String = ""
     )
 
@@ -140,8 +141,13 @@ class BookRepository(private val context: Context) {
                     ?: coverObject["small"]?.jsonPrimitive?.contentOrNull
             }
         val authors = extractAuthors(resource)
+        val narrators = if (ref.type == ResourceType.AUDIOBOOK) {
+            extractPeople(resource, listOf("narrators", "narrators_objects"))
+        } else {
+            emptyList()
+        }
 
-        return ResourceInfo(ref.id, ref.type, title, cover, authors, body)
+        return ResourceInfo(ref.id, ref.type, title, cover, authors, narrators, body)
     }
 
     /**
@@ -161,12 +167,28 @@ class BookRepository(private val context: Context) {
             ResourceType.BOOK
         }
 
+        // Самый надёжный источник связи между текстом и аудио — переключатель
+        // «Текст / Аудио» на публичной странице Яндекс Книг. В отличие от поиска
+        // он связывает именно версии одного произведения, а не просто совпадения
+        // по названию. Если сайт временно недоступен, используем строгий GraphQL fallback.
+        val publicLookup = runCatching { findPublicCounterpart(ref, counterpartType) }
+
         val counterpart = runCatching {
-            val candidate = searchCounterpart(initial, counterpartType, token) ?: return@runCatching null
-            getResourceInfo(
-                BookReference(candidate.id, ref.sourceUrl, candidate.type),
-                token
-            )
+            if (publicLookup.isSuccess) {
+                // Если публичная карточка загрузилась успешно, отсутствие кнопки
+                // второй версии считаем достоверным ответом и НЕ подмешиваем
+                // похожую книгу из поиска. Именно это устраняет ложные значки.
+                publicLookup.getOrNull()?.let { getResourceInfo(it, token) }
+            } else {
+                // Fallback нужен только если сам сайт карточки не удалось прочитать.
+                val candidate = searchCounterpart(initial, counterpartType, token)
+                    ?: return@runCatching null
+                val candidateUrl = when (candidate.type) {
+                    ResourceType.BOOK -> "https://books.yandex.ru/books/${candidate.id}"
+                    ResourceType.AUDIOBOOK -> "https://books.yandex.ru/audiobooks/${candidate.id}"
+                }
+                getResourceInfo(BookReference(candidate.id, candidateUrl, candidate.type), token)
+            }
         }.getOrNull()
 
         if (counterpart?.type == ResourceType.BOOK) text = counterpart
@@ -221,9 +243,14 @@ class BookRepository(private val context: Context) {
             .asSequence()
             .filter { it.type == targetType }
             .filter { normalize(it.title) == initialTitle }
+            .filter { candidate ->
+                // Совпадения только по названию недостаточно: в каталоге много
+                // разных произведений/изданий с одинаковыми названиями.
+                if (initialAuthors.isEmpty()) false
+                else candidate.authors.map(::normalize).any { it in initialAuthors }
+            }
             .sortedByDescending { candidate ->
-                if (initialAuthors.isEmpty()) 0
-                else candidate.authors.map(::normalize).count { it in initialAuthors }
+                candidate.authors.map(::normalize).count { it in initialAuthors }
             }
             .firstOrNull()
     }
@@ -313,8 +340,10 @@ class BookRepository(private val context: Context) {
                     else "https://books.yandex.ru/audiobooks/${primary.id}",
                     workKey = makeWorkKey(primary.title, primary.authors),
                     inLibrary = versions.any { it.inLibrary },
-                    hasText = versions.any { it.type == ResourceType.BOOK },
-                    hasAudio = versions.any { it.type == ResourceType.AUDIOBOOK }
+                    // Наличие второй версии подтверждаем отдельно через карточку
+                    // произведения. Сам Search может отдавать похожие издания рядом.
+                    hasText = primary.type == ResourceType.BOOK,
+                    hasAudio = primary.type == ResourceType.AUDIOBOOK
                 )
             }
 
@@ -452,8 +481,10 @@ class BookRepository(private val context: Context) {
                     coverUrl = primary.coverUrl ?: versions.firstNotNullOfOrNull { it.coverUrl },
                     authors = primary.authors.ifEmpty { versions.flatMap { it.authors }.distinct() },
                     inLibrary = versions.any { it.inLibrary },
-                    hasText = versions.any { it.hasText || it.type == ResourceType.BOOK },
-                    hasAudio = versions.any { it.hasAudio || it.type == ResourceType.AUDIOBOOK }
+                    // Не делаем вывод о второй версии только по соседней HTML-карточке:
+                    // это давало ложные значки. Точная проверка выполняется лениво.
+                    hasText = primary.type == ResourceType.BOOK,
+                    hasAudio = primary.type == ResourceType.AUDIOBOOK
                 )
             }
     }
@@ -570,9 +601,46 @@ class BookRepository(private val context: Context) {
         return emptyList()
     }
 
-    private fun extractAuthors(resource: JsonObject): List<String> {
-        val candidates = listOf("authors_objects", "authors")
-        for (key in candidates) {
+    private fun findPublicCounterpart(
+        ref: BookReference,
+        targetType: ResourceType
+    ): BookReference? {
+        val sourceUrl = ref.sourceUrl.takeIf { it.isNotBlank() } ?: when (ref.type) {
+            ResourceType.BOOK -> "https://books.yandex.ru/books/${ref.id}"
+            ResourceType.AUDIOBOOK -> "https://books.yandex.ru/audiobooks/${ref.id}"
+        }
+        val doc = Jsoup.parse(executeHtml(sourceUrl), sourceUrl)
+        val targetLabel = if (targetType == ResourceType.BOOK) "текст" else "аудио"
+
+        // На карточке Яндекс Книг присутствует переключатель «Текст / Аудио».
+        // Ссылки из него являются прямой связью между двумя версиями произведения.
+        val labelled = doc.select("a[href*='/books/'], a[href*='/audiobooks/']")
+            .asSequence()
+            .filter { normalize(it.text()) == targetLabel }
+            .mapNotNull { anchor -> BookUrlParser.parse(absoluteHref(anchor)) }
+            .firstOrNull { candidate ->
+                candidate.type == targetType &&
+                    !(candidate.type == ref.type && candidate.id == ref.id)
+            }
+        if (labelled != null) return labelled
+
+        return null
+    }
+
+    /** Проверяет реальные доступные версии произведения по его карточке. */
+    suspend fun verifyAvailability(
+        ref: BookReference,
+        token: String
+    ): Pair<Boolean, Boolean> {
+        val bundle = getResourceBundle(ref, token)
+        return (bundle.text != null) to (bundle.audio != null)
+    }
+
+    private fun extractAuthors(resource: JsonObject): List<String> =
+        extractPeople(resource, listOf("authors_objects", "authors"))
+
+    private fun extractPeople(resource: JsonObject, keys: List<String>): List<String> {
+        for (key in keys) {
             val array = resource[key] as? JsonArray ?: continue
             val names = array.mapNotNull { item ->
                 when (item) {
@@ -669,68 +737,32 @@ class BookRepository(private val context: Context) {
     /**
      * В library_cards API добавляется именно UUID базовой книги (book_uuid).
      * У ссылок на аудиокниги UUID может отличаться, поэтому для аудиоверсии
-     * сначала получаем канонический Book UUID через GraphQL Search.
+     * сначала получаем связанную текстовую карточку через переключатель
+     * «Текст / Аудио» на странице Яндекс Книг.
      */
     suspend fun addResourceToLibrary(
         resourceId: String,
         resourceType: ResourceType,
-        title: String,
-        authors: List<String>,
+        sourceUrl: String,
         token: String
     ): Boolean {
         val bookUuid = if (resourceType == ResourceType.BOOK) {
             resourceId
         } else {
-            findCanonicalBookUuid(title, authors, token) ?: resourceId
+            val audioRef = BookReference(
+                id = resourceId,
+                sourceUrl = sourceUrl.ifBlank { "https://books.yandex.ru/audiobooks/$resourceId" },
+                type = ResourceType.AUDIOBOOK
+            )
+
+            // library_cards принимает book_uuid. Для аудиокниги нельзя передавать
+            // UUID аудиоресурса: сервер отвечает 404. Получаем связанную текстовую
+            // карточку через реальный переключатель «Текст / Аудио», а GraphQL
+            // используется только как строгий fallback в getResourceBundle().
+            getResourceBundle(audioRef, token).text?.id
+                ?: error("Не удалось определить карточку Яндекс Книг для добавления этой аудиокниги")
         }
         return addToLibrary(bookUuid, token)
-    }
-
-    private suspend fun findCanonicalBookUuid(
-        title: String,
-        authors: List<String>,
-        token: String
-    ): String? {
-        if (title.isBlank()) return null
-        val variables = buildJsonObject {
-            put("query", buildJsonObject {
-                put("cursor", "")
-                put("noMisspell", false)
-                put("query", title)
-                put("types", buildJsonArray { })
-            })
-        }
-        val payload = buildJsonObject {
-            put("operationName", "Search")
-            put("query", GQL_SEARCH)
-            put("variables", variables)
-        }.toString()
-
-        val response = api.postGraphQl(
-            BookmateApiFactory.GRAPHQL_URL,
-            token,
-            body = payload.toRequestBody(JSON_MEDIA_TYPE)
-        )
-        if (!response.isSuccessful) return null
-        val body = response.body()?.string() ?: return null
-        val root = runCatching { Json.parseToJsonElement(body).jsonObject }.getOrNull() ?: return null
-        val page = root["data"]?.let { it as? JsonObject }
-            ?.get("search")?.let { it as? JsonObject }
-            ?.get("page") as? JsonArray
-            ?: return null
-
-        val normalizedTitle = normalize(title)
-        val normalizedAuthors = authors.map(::normalize).filter { it.isNotBlank() }.toSet()
-
-        return page.mapNotNull(::parseSearchCandidate)
-            .asSequence()
-            .filter { normalize(it.title) == normalizedTitle }
-            .sortedByDescending { candidate ->
-                if (normalizedAuthors.isEmpty()) 0
-                else candidate.authors.map(::normalize).count { it in normalizedAuthors }
-            }
-            .firstOrNull()
-            ?.id
     }
 
     suspend fun addToLibrary(bookUuid: String, token: String): Boolean {

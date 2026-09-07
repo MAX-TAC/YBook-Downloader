@@ -108,6 +108,8 @@ import com.maxim.ybookdownloader.util.ResourceType
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -160,6 +162,7 @@ data class BookUiState(
     val title: String? = null,
     val coverUrl: String? = null,
     val authors: List<String> = emptyList(),
+    val narrators: List<String> = emptyList(),
     val bookId: String? = null,
     val resourceType: ResourceType? = null,
     val textId: String? = null,
@@ -280,6 +283,13 @@ class MainViewModel : ViewModel() {
         private set
     private var homeLoaded = false
 
+    // Проверка наличия текстовой/аудиоверсии выполняется лениво только для
+    // реально показанных карточек. Это исключает ложные значки из Search/HTML.
+    private val availabilityChecked = mutableSetOf<String>()
+    private val availabilityPending = mutableSetOf<String>()
+    private val availabilitySemaphore = Semaphore(permits = 3)
+    private var favoriteAvailability by mutableStateOf<Map<String, Pair<Boolean, Boolean>>>(emptyMap())
+
     fun init(context: Context) {
         if (!::repository.isInitialized) {
             val appContext = context.applicationContext
@@ -333,6 +343,7 @@ class MainViewModel : ViewModel() {
             title = null,
             coverUrl = null,
             authors = emptyList(),
+            narrators = emptyList(),
             bookId = null,
             resourceType = null,
             textId = null,
@@ -359,12 +370,18 @@ class MainViewModel : ViewModel() {
                     val cachedFavoriteState = favorites.any { it.workKey == bundle.workKey }
                     currentInLibrary = inLibraryHint ?: cachedCatalogState ?: cachedFavoriteState
 
+                    val canonicalAuthors = bundle.text?.authors?.takeIf { it.isNotEmpty() }
+                        ?: bundle.audio?.authors.orEmpty()
                     state = state.copy(
                         busy = false,
                         progressLabel = null,
                         title = selected.title,
                         coverUrl = selected.coverUrl,
-                        authors = selected.authors,
+                        authors = canonicalAuthors,
+                        narrators = if (selected.type == ResourceType.AUDIOBOOK)
+                            bundle.audio?.narrators.orEmpty()
+                        else
+                            emptyList(),
                         bookId = selected.id,
                         resourceType = selected.type,
                         textId = bundle.text?.id,
@@ -389,10 +406,12 @@ class MainViewModel : ViewModel() {
         } ?: return
 
         epubFile = if (type == ResourceType.BOOK) epubFile else null
+        val canonicalAuthors = textInfo?.authors?.takeIf { it.isNotEmpty() } ?: info.authors
         state = state.copy(
             title = info.title,
             coverUrl = info.coverUrl,
-            authors = info.authors,
+            authors = canonicalAuthors,
+            narrators = if (type == ResourceType.AUDIOBOOK) audioInfo?.narrators.orEmpty() else emptyList(),
             bookId = info.id,
             resourceType = info.type,
             error = null,
@@ -702,12 +721,72 @@ class MainViewModel : ViewModel() {
                     coverUrl = primary.coverUrl ?: secondary.coverUrl,
                     authors = primary.authors.ifEmpty { secondary.authors },
                     inLibrary = previous.inLibrary || item.inLibrary,
-                    hasText = previous.hasText || item.hasText,
-                    hasAudio = previous.hasAudio || item.hasAudio
+                    // Не считаем совпавший Search-сниппет доказательством второй версии.
+                    // Если карточка уже была проверена и у неё обе версии — сохраняем это.
+                    hasText = if (primary.hasText && primary.hasAudio) true else primary.type == ResourceType.BOOK,
+                    hasAudio = if (primary.hasText && primary.hasAudio) true else primary.type == ResourceType.AUDIOBOOK
                 )
             }
         }
         return merged.values.toList()
+    }
+
+    fun resolveCatalogAvailability(item: BookRepository.CatalogItem) {
+        val token = tokenStore.getToken() ?: return
+        val key = "catalog|${item.type}|${item.id}"
+        if (key in availabilityChecked || !availabilityPending.add(key)) return
+
+        viewModelScope.launch {
+            runCatching {
+                availabilitySemaphore.withPermit {
+                    withContext(Dispatchers.IO) {
+                        repository.verifyAvailability(
+                            BookReference(item.id, item.sourceUrl, item.type),
+                            token
+                        )
+                    }
+                }
+            }.onSuccess { (hasText, hasAudio) ->
+                availabilityPending.remove(key)
+                availabilityChecked += key
+                catalogResults = catalogResults.map { current ->
+                    if (current.type == item.type && current.id == item.id)
+                        current.copy(hasText = hasText, hasAudio = hasAudio)
+                    else current
+                }
+                homeSections = homeSections.map { section ->
+                    section.copy(items = section.items.map { current ->
+                        if (current.type == item.type && current.id == item.id)
+                            current.copy(hasText = hasText, hasAudio = hasAudio)
+                        else current
+                    })
+                }
+            }.onFailure {
+                availabilityPending.remove(key)
+                // Ошибка проверки не ломает карточку: остаётся значок точного ресурса.
+            }
+        }
+    }
+
+    fun resolveFavoriteAvailability(item: FavoriteBookSummary) {
+        val token = tokenStore.getToken() ?: return
+        val ref = item.reference
+        val key = "favorite|${ref.type}|${ref.id}"
+        if (key in availabilityChecked || !availabilityPending.add(key)) return
+
+        viewModelScope.launch {
+            runCatching {
+                availabilitySemaphore.withPermit {
+                    withContext(Dispatchers.IO) { repository.verifyAvailability(ref, token) }
+                }
+            }.onSuccess { availability ->
+                availabilityPending.remove(key)
+                availabilityChecked += key
+                favoriteAvailability = favoriteAvailability + (item.key to availability)
+            }.onFailure {
+                availabilityPending.remove(key)
+            }
+        }
     }
 
     fun openCatalogItem(item: BookRepository.CatalogItem) {
@@ -740,8 +819,7 @@ class MainViewModel : ViewModel() {
                         repository.addResourceToLibrary(
                             resourceId = item.id,
                             resourceType = item.type,
-                            title = item.title,
-                            authors = item.authors,
+                            sourceUrl = item.sourceUrl,
                             token = token
                         )
                         true
@@ -798,8 +876,7 @@ class MainViewModel : ViewModel() {
                                 ResourceType.BOOK
                             else
                                 state.resourceType ?: ResourceType.BOOK,
-                            title = state.title.orEmpty(),
-                            authors = state.authors,
+                            sourceUrl = state.url,
                             token = token
                         )
                         true
@@ -889,6 +966,7 @@ class MainViewModel : ViewModel() {
             .groupBy { it.workKey.ifBlank { BookRepository.makeWorkKey(it.title, it.authors) } }
             .map { (key, items) ->
                 val primary = items.firstOrNull { it.type == ResourceType.BOOK } ?: items.first()
+                val verified = favoriteAvailability[key]
                 FavoriteBookSummary(
                     key = key,
                     title = primary.title,
@@ -896,8 +974,10 @@ class MainViewModel : ViewModel() {
                     authors = primary.authors.ifEmpty { items.flatMap { it.authors }.distinct() },
                     reference = BookReference(primary.id, primary.sourceUrl, primary.type),
                     libraryCardUuids = items.mapNotNull { it.libraryCardUuid }.distinct(),
-                    hasText = items.any { it.type == ResourceType.BOOK },
-                    hasAudio = items.any { it.type == ResourceType.AUDIOBOOK }
+                    // До проверки показываем только тип реально открываемой карточки.
+                    // Второй значок добавляется только после подтверждения на странице произведения.
+                    hasText = verified?.first ?: (primary.type == ResourceType.BOOK),
+                    hasAudio = verified?.second ?: (primary.type == ResourceType.AUDIOBOOK)
                 )
             }
     }
@@ -1054,6 +1134,9 @@ class MainViewModel : ViewModel() {
         homeSections = emptyList()
         popularSearches = emptyList()
         homeLoaded = false
+        availabilityChecked.clear()
+        availabilityPending.clear()
+        favoriteAvailability = emptyMap()
         state = BookUiState()
     }
 
@@ -1326,7 +1409,8 @@ fun YBookApp(
                         onBook = { item ->
                             openCatalogItem(item, AppSection.HOME, openedSection.title)
                         },
-                        onToggleFavorite = vm::toggleCatalogFavorite
+                        onToggleFavorite = vm::toggleCatalogFavorite,
+                        onResolveAvailability = vm::resolveCatalogAvailability
                     )
                 } else {
                     DiscoveryHomeScreen(
@@ -1337,6 +1421,7 @@ fun YBookApp(
                         error = vm.homeError,
                         onRefresh = { vm.loadHome(force = true) },
                         onBook = { item -> openCatalogItem(item, AppSection.HOME) },
+                        onResolveAvailability = vm::resolveCatalogAvailability,
                         onOpenSection = { selectedHomeSectionTitle = it.title },
                         onPopularSearch = { query ->
                             catalogInput = query
@@ -1365,6 +1450,7 @@ fun YBookApp(
                 onOpenLink = { openLinkDialog() },
                 onOpenResult = { item -> openCatalogItem(item, AppSection.SEARCH) },
                 onToggleFavorite = vm::toggleCatalogFavorite,
+                onResolveAvailability = vm::resolveCatalogAvailability,
                 onLoadMore = vm::loadMoreCatalog,
                 onSelectType = vm::selectResourceType,
                 onDownload = {
@@ -1384,6 +1470,7 @@ fun YBookApp(
                 onRefresh = { vm.loadFavorites(force = true) },
                 onLoadMore = vm::loadMoreFavorites,
                 onRemove = vm::removeFavorite,
+                onResolveAvailability = vm::resolveFavoriteAvailability,
                 onOpen = { item ->
                     bookReturnSection = AppSection.FAVORITES
                     bookReturnHomeSectionTitle = null
@@ -1511,6 +1598,7 @@ private fun DiscoveryHomeScreen(
     error: String?,
     onRefresh: () -> Unit,
     onBook: (BookRepository.CatalogItem) -> Unit,
+    onResolveAvailability: (BookRepository.CatalogItem) -> Unit,
     onOpenSection: (BookRepository.HomeSection) -> Unit,
     onPopularSearch: (String) -> Unit
 ) {
@@ -1549,7 +1637,11 @@ private fun DiscoveryHomeScreen(
                 item(key = "row-${section.title}") {
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         items(section.items.take(10), key = { "${it.type}-${it.id}" }) { book ->
-                            HomeBookCard(book = book, onClick = { onBook(book) })
+                            HomeBookCard(
+                                book = book,
+                                onClick = { onBook(book) },
+                                onResolveAvailability = { onResolveAvailability(book) }
+                            )
                         }
                     }
                 }
@@ -1585,14 +1677,14 @@ private fun MediaTypeIcons(
     if (!hasText && !hasAudio) return
     Row(
         modifier = modifier,
-        horizontalArrangement = Arrangement.spacedBy(7.dp),
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         if (hasText) {
             Icon(
                 Icons.Default.MenuBook,
                 contentDescription = "Есть текстовая версия",
-                modifier = Modifier.size(18.dp),
+                modifier = Modifier.size(16.dp),
                 tint = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
@@ -1600,7 +1692,7 @@ private fun MediaTypeIcons(
             Icon(
                 Icons.Default.Headphones,
                 contentDescription = "Есть аудиоверсия",
-                modifier = Modifier.size(18.dp),
+                modifier = Modifier.size(16.dp),
                 tint = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
@@ -1608,7 +1700,41 @@ private fun MediaTypeIcons(
 }
 
 @Composable
-private fun HomeBookCard(book: BookRepository.CatalogItem, onClick: () -> Unit) {
+private fun MediaAndAuthorLine(
+    hasText: Boolean,
+    hasAudio: Boolean,
+    authors: List<String>,
+    maxLines: Int = 1
+) {
+    if (!hasText && !hasAudio && authors.isEmpty()) return
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        MediaTypeIcons(hasText = hasText, hasAudio = hasAudio)
+        if (authors.isNotEmpty()) {
+            Text(
+                authors.joinToString(", "),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = maxLines,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+        }
+    }
+}
+
+@Composable
+private fun HomeBookCard(
+    book: BookRepository.CatalogItem,
+    onClick: () -> Unit,
+    onResolveAvailability: () -> Unit
+) {
+    LaunchedEffect(book.type, book.id) {
+        onResolveAvailability()
+    }
     Card(
         onClick = onClick,
         modifier = Modifier.width(148.dp).height(300.dp)
@@ -1629,18 +1755,12 @@ private fun HomeBookCard(book: BookRepository.CatalogItem, onClick: () -> Unit) 
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis
                 )
-                if (book.authors.isNotEmpty()) {
-                    Text(
-                        book.authors.joinToString(", "),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-                MediaTypeIcons(
+                // Значки формата стоят непосредственно перед автором в одной строке.
+                MediaAndAuthorLine(
                     hasText = book.hasText,
-                    hasAudio = book.hasAudio
+                    hasAudio = book.hasAudio,
+                    authors = book.authors,
+                    maxLines = 1
                 )
             }
         }
@@ -1672,7 +1792,8 @@ private fun HomeSectionScreen(
     modifier: Modifier,
     section: BookRepository.HomeSection,
     onBook: (BookRepository.CatalogItem) -> Unit,
-    onToggleFavorite: (BookRepository.CatalogItem) -> Unit
+    onToggleFavorite: (BookRepository.CatalogItem) -> Unit,
+    onResolveAvailability: (BookRepository.CatalogItem) -> Unit
 ) {
     Column(
         modifier = modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 12.dp),
@@ -1684,6 +1805,7 @@ private fun HomeSectionScreen(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             items(section.items, key = { "section-${it.type}-${it.id}" }) { book ->
+                LaunchedEffect(book.type, book.id) { onResolveAvailability(book) }
                 Card(onClick = { onBook(book) }, modifier = Modifier.fillMaxWidth()) {
                     Row(
                         modifier = Modifier.padding(12.dp),
@@ -1705,18 +1827,11 @@ private fun HomeSectionScreen(
                                 maxLines = 3,
                                 overflow = TextOverflow.Ellipsis
                             )
-                            if (book.authors.isNotEmpty()) {
-                                Text(
-                                    book.authors.joinToString(", "),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                            MediaTypeIcons(
+                            MediaAndAuthorLine(
                                 hasText = book.hasText,
-                                hasAudio = book.hasAudio
+                                hasAudio = book.hasAudio,
+                                authors = book.authors,
+                                maxLines = 2
                             )
                         }
                         IconButton(onClick = { onToggleFavorite(book) }) {
@@ -1748,6 +1863,7 @@ private fun CatalogSearchScreen(
     onOpenLink: () -> Unit,
     onOpenResult: (BookRepository.CatalogItem) -> Unit,
     onToggleFavorite: (BookRepository.CatalogItem) -> Unit,
+    onResolveAvailability: (BookRepository.CatalogItem) -> Unit,
     onLoadMore: () -> Unit,
     onSelectType: (ResourceType) -> Unit,
     onDownload: () -> Unit,
@@ -1820,7 +1936,12 @@ private fun CatalogSearchScreen(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             items(results, key = { it.workKey.ifBlank { "${it.type}|${it.id}" } }) { item ->
-                CatalogResultCard(item, { onOpenResult(item) }, { onToggleFavorite(item) })
+                CatalogResultCard(
+                    item = item,
+                    onOpen = { onOpenResult(item) },
+                    onToggleFavorite = { onToggleFavorite(item) },
+                    onResolveAvailability = { onResolveAvailability(item) }
+                )
             }
             if (hasMore || (busy && results.isNotEmpty())) {
                 item(key = "catalog-more-${results.size}") {
@@ -1839,8 +1960,10 @@ private fun CatalogSearchScreen(
 private fun CatalogResultCard(
     item: BookRepository.CatalogItem,
     onOpen: () -> Unit,
-    onToggleFavorite: () -> Unit
+    onToggleFavorite: () -> Unit,
+    onResolveAvailability: () -> Unit
 ) {
+    LaunchedEffect(item.type, item.id) { onResolveAvailability() }
     Card(onClick = onOpen, modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier.padding(12.dp),
@@ -1852,17 +1975,11 @@ private fun CatalogResultCard(
             }
             Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                 Text(item.title, style = MaterialTheme.typography.titleMedium)
-                if (item.authors.isNotEmpty()) {
-                    Text(
-                        item.authors.joinToString(", "),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 2
-                    )
-                }
-                MediaTypeIcons(
+                MediaAndAuthorLine(
                     hasText = item.hasText,
-                    hasAudio = item.hasAudio
+                    hasAudio = item.hasAudio,
+                    authors = item.authors,
+                    maxLines = 2
                 )
             }
             IconButton(onClick = onToggleFavorite) {
@@ -1939,8 +2056,17 @@ private fun BookDetailScreen(
                     if (state.authors.isNotEmpty()) {
                         Spacer(Modifier.height(6.dp))
                         Text(
-                            state.authors.joinToString(", "),
+                            "Автор: ${state.authors.joinToString(", ")}",
                             style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                    if (state.resourceType == ResourceType.AUDIOBOOK && state.narrators.isNotEmpty()) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "Чтец: ${state.narrators.joinToString(", ")}",
+                            style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             textAlign = TextAlign.Center
                         )
@@ -2124,6 +2250,7 @@ private fun FavoritesScreen(
     onRefresh: () -> Unit,
     onLoadMore: () -> Unit,
     onRemove: (FavoriteBookSummary) -> Unit,
+    onResolveAvailability: (FavoriteBookSummary) -> Unit,
     onOpen: (FavoriteBookSummary) -> Unit
 ) {
     var query by remember { mutableStateOf("") }
@@ -2189,7 +2316,8 @@ private fun FavoritesScreen(
                         FavoriteBookCard(
                             item = item,
                             onClick = { onOpen(item) },
-                            onRemove = { onRemove(item) }
+                            onRemove = { onRemove(item) },
+                            onResolveAvailability = { onResolveAvailability(item) }
                         )
                     }
                     if (favoriteItems.isNotEmpty() &&
@@ -2213,8 +2341,10 @@ private fun FavoritesScreen(
 private fun FavoriteBookCard(
     item: FavoriteBookSummary,
     onClick: () -> Unit,
-    onRemove: () -> Unit
+    onRemove: () -> Unit,
+    onResolveAvailability: () -> Unit
 ) {
+    LaunchedEffect(item.reference.type, item.reference.id) { onResolveAvailability() }
     Card(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier.padding(12.dp),
@@ -2229,17 +2359,11 @@ private fun FavoriteBookCard(
                 verticalArrangement = Arrangement.spacedBy(3.dp)
             ) {
                 Text(item.title, style = MaterialTheme.typography.titleMedium)
-                if (item.authors.isNotEmpty()) {
-                    Text(
-                        item.authors.joinToString(", "),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 2
-                    )
-                }
-                MediaTypeIcons(
+                MediaAndAuthorLine(
                     hasText = item.hasText,
-                    hasAudio = item.hasAudio
+                    hasAudio = item.hasAudio,
+                    authors = item.authors,
+                    maxLines = 2
                 )
             }
             IconButton(onClick = onRemove) {
