@@ -2,6 +2,7 @@ package com.maxim.ybookdownloader.data
 
 import android.content.Context
 import com.maxim.ybookdownloader.util.BookReference
+import com.maxim.ybookdownloader.util.BookUrlParser
 import com.maxim.ybookdownloader.util.ResourceType
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
