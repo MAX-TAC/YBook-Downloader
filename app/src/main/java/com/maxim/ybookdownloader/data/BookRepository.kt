@@ -1,5 +1,6 @@
 package com.maxim.ybookdownloader.data
 
+import com.maxim.ybookdownloader.util.BookUrlParser
 import android.content.Context
 import com.maxim.ybookdownloader.util.BookReference
 import com.maxim.ybookdownloader.util.ResourceType
